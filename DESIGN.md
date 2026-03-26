@@ -112,6 +112,7 @@ var (
     ErrInvalidStatus  = errors.New("invalid status value")
     ErrInvalidPriority = errors.New("priority must be 0-4")
     ErrTitleRequired  = errors.New("title is required")
+    ErrCorruptFile    = errors.New("issue file is corrupt")
 )
 ```
 
@@ -219,7 +220,7 @@ Binary name: `tq`
 ### Commands
 
 ```
-tq init [--prefix PREFIX]
+tq init [--prefix PREFIX] [--dir PATH]
 tq create TITLE [options]
 tq show ID [--json]
 tq list [options] [--json]
@@ -235,6 +236,13 @@ tq dep list ID [--json]
 tq doctor [--json]
 tq help [command]
 ```
+
+### Global Flags
+
+These flags apply to all commands (except `help`):
+
+- `--dir PATH` — use `PATH` as the workspace root. Overrides `TQ_DIR` and upward discovery. On `init`, this is the directory where `.tq/` will be created. On all other commands, this is where `.tq/` is expected to exist.
+- `--json` — where supported, output machine-readable JSON to stdout instead of human-readable text. Not all commands support this (see individual command details).
 
 ### Command Details
 
@@ -312,6 +320,8 @@ Options:
 - `--json` — output updated issue JSON
 
 All fields are independently optional. Only specified fields are changed. `updated_at` is set to now on every successful update.
+
+Status changes via `update` must follow the valid transitions defined in the Statuses section. In particular, `update --status` on a closed issue fails with `ErrInvalidStatus` — use `tq reopen` to transition a closed issue back to `open`.
 
 #### `tq close ID [--reason TEXT] [--actor NAME]`
 
@@ -416,8 +426,7 @@ ready(all_issues) → []Issue:
         for each blocker_id in candidate.blocked_by:
             blocker = lookup(blocker_id, all_issues)
             if blocker is nil:
-                is_ready = true              # orphan dep: treat as non-blocking (doctor warns)
-                continue
+                continue                     # orphan dep: treat as non-blocking (doctor warns)
             if blocker.status != "closed":
                 is_ready = false
                 break
@@ -454,7 +463,7 @@ Explicit behavior for cases that implementing agents must not invent answers for
 
 **Updating fields on a closed issue.** Allowed for all fields except status (use `reopen` for that). Priority, labels, assignee, and description can be changed on closed issues. `updated_at` is set to now.
 
-**Malformed issue file.** If a file in `.tq/issues/` contains invalid JSON or fails ID validation, `list`, `ready`, and other multi-issue operations **skip the malformed file** and emit a warning to stderr. They do not fail entirely — one corrupt file should not block all operations. `doctor` reports malformed files as errors. `show` on the specific malformed issue returns an error.
+**Malformed issue file.** If a file in `.tq/issues/` contains invalid JSON or fails ID validation, `list`, `ready`, and other multi-issue operations **skip the malformed file** and emit a warning to stderr. They do not fail entirely — one corrupt file should not block all operations. `doctor` reports malformed files as errors. `show` on the specific malformed issue returns `ErrCorruptFile`.
 
 **Empty issues directory.** `ready`, `list`, and `dep list` return empty results, not errors.
 
@@ -470,7 +479,7 @@ Explicit behavior for cases that implementing agents must not invent answers for
 
 tq uses file locking for safe concurrent access. The lock file is `.tq/lock`.
 
-### Mutation operations (create, update, close, reopen, comment, dep add, dep remove):
+### Mutation operations (create, claim, update, close, reopen, comment, dep add, dep remove):
 
 1. Open `.tq/lock` for exclusive write (flock LOCK_EX)
 2. Read relevant issue file(s)
@@ -609,36 +618,47 @@ type DoctorCheck struct {
 ### Store tests (temp directories)
 
 - **Init**: creates correct directory structure and config
-- **Init duplicate**: fails when `.tq/` exists
+- **Init duplicate**: fails when `.tq/` exists (`ErrAlreadyInit`)
 - **Create + Show**: round-trip
 - **Create**: file appears in `.tq/issues/`, correct JSON, correct ID format
 - **Show partial ID**: resolves unique prefix, fails on ambiguous prefix
+- **Show malformed file**: returns `ErrCorruptFile`
 - **List**: filtering by status, label, assignee, priority
 - **List default**: excludes closed issues
+- **List with malformed file**: skips corrupt file, returns valid issues, emits warning
 - **Update**: changes fields, updates `updated_at`
 - **Update closed issue**: can change priority, labels, assignee
+- **Update status on closed issue**: fails with `ErrInvalidStatus`
 - **Claim**: sets status + assignee, fails on non-open issue (ErrAlreadyClaimed with current status/assignee)
 - **Claim already in_progress**: fails with ErrAlreadyClaimed
 - **Close**: sets status, closed_at, close_reason
-- **Reopen**: clears closed_at, close_reason, sets status to open
+- **Close with actor**: sets assignee
+- **Reopen**: clears closed_at, close_reason, sets status to open, preserves assignee
 - **Comment**: appends to comments list
-- **Dep add**: adds to blocked_by, fails on cycle, fails on self, fails on non-existent
+- **Dep add**: adds to blocked_by, fails on cycle, fails on self, fails on non-existent, fails on duplicate (`ErrDupDep`)
+- **Dep add to/from closed issue**: succeeds (deps are structural)
 - **Dep remove**: removes from blocked_by
+- **Dep remove non-existent**: fails with `ErrDepNotFound`
 - **Ready**: end-to-end with real files
-- **Doctor**: detects orphan deps, cycles, invalid files
+- **Ready with malformed file**: skips corrupt file, returns valid ready issues
+- **Doctor**: detects orphan deps, cycles, invalid files, malformed JSON
 
 ### CLI tests
 
 Build the binary, run it against a temp directory, check exit codes and stdout/stderr. These test the command parsing and output formatting layer — they should not duplicate the store test logic.
 
 - `tq init` + `tq create` + `tq show` round-trip
+- `tq init --dir PATH` creates workspace at PATH
 - `tq ready --json` output is valid JSON array
 - `tq show --json` output is valid JSON object
 - `tq claim` on already-claimed issue exits non-zero with status and assignee in message
 - `tq claim` on open issue succeeds
+- `tq update --status in_progress` on closed issue exits non-zero
 - `tq dep add` cycle rejection exits non-zero with clear message
 - `tq doctor --json` output schema
 - Partial ID matching in commands
+- `--dir` flag overrides workspace discovery
+- `TQ_DIR` env var overrides workspace discovery
 
 ### What not to test
 
@@ -723,10 +743,11 @@ The task queue is a general-purpose primitive. Building it as a standalone tool 
 
 Build in this order. Each step produces a `go test ./...`-passing commit.
 
-### Step 1: Types and Validation
+### Step 1: Types, Errors, and Validation
 - `issue.go`: Issue, Comment, CreateOpts, UpdateOpts, ListFilter types
+- `issue.go`: sentinel errors (ErrNotFound, ErrAlreadyClaimed, ErrCycleDetected, etc.)
 - `issue.go`: ID generation (prefix + 4 hex via crypto/rand)
-- `issue.go`: validation functions (required fields, status values, priority range)
+- `issue.go`: validation functions (required fields, status values, priority range, status transitions)
 - `issue_test.go`: table-driven validation tests, ID format tests
 
 ### Step 2: Store — Init, Read, Write
