@@ -94,6 +94,33 @@ Invariants enforced by tq:
 - Cannot add a self-dependency.
 - Cannot create a dependency cycle. Cycle detection runs on every `dep add`.
 
+## Errors
+
+The library defines sentinel errors for all failure modes that callers need to distinguish programmatically. All errors are wrapped with `fmt.Errorf("...: %w", err)` to support `errors.Is()`.
+
+```go
+var (
+    ErrNotFound       = errors.New("issue not found")
+    ErrAmbiguousID    = errors.New("ambiguous issue ID")
+    ErrAlreadyClaimed = errors.New("issue is not open")
+    ErrCycleDetected  = errors.New("dependency would create cycle")
+    ErrSelfDep        = errors.New("cannot depend on self")
+    ErrDupDep         = errors.New("dependency already exists")
+    ErrDepNotFound    = errors.New("dependency does not exist")
+    ErrNotInitialized = errors.New("tq workspace not found")
+    ErrAlreadyInit    = errors.New("tq workspace already exists")
+    ErrInvalidStatus  = errors.New("invalid status value")
+    ErrInvalidPriority = errors.New("priority must be 0-4")
+    ErrTitleRequired  = errors.New("title is required")
+)
+```
+
+The CLI maps these to stderr messages and exit code 1. Error messages should be specific and actionable. Examples:
+
+- `Claim` on an in_progress issue: `"cannot claim orca-a1b2: issue is not open (status: in_progress, assignee: agent-1)"`
+- Ambiguous partial ID: `"ambiguous ID 'a1b': matches orca-a1b2, orca-a1b9"`
+- Cycle detected: `"cannot add dependency: orca-a1b2 → orca-c3d4 would create cycle"`
+
 ## Storage
 
 ### Layout
@@ -170,6 +197,21 @@ lock
 
 The lock file is runtime-only and must not be committed.
 
+### Workspace Discovery
+
+The CLI must find the `.tq/` directory before executing any command (except `init` and `help`).
+
+**Resolution order:**
+1. `--dir PATH` flag (if provided on any command) — use `PATH/.tq/` directly.
+2. `TQ_DIR` environment variable (if set) — use `$TQ_DIR/.tq/` directly.
+3. Walk upward from CWD: check CWD for `.tq/`, then parent, then grandparent, etc. Stop at filesystem root.
+
+If no `.tq/` directory is found, fail with `ErrNotInitialized` and a message suggesting `tq init`.
+
+The library `Open(dir)` function takes an explicit path and does no discovery. The caller is responsible for passing the right directory. This keeps the library simple and testable while letting the CLI handle user-facing convenience.
+
+For orca integration: orca calls `tq.Open(primaryRepoPath)` with an explicit path. No discovery needed.
+
 ## CLI Interface
 
 Binary name: `tq`
@@ -182,6 +224,7 @@ tq create TITLE [options]
 tq show ID [--json]
 tq list [options] [--json]
 tq ready [--json]
+tq claim ID --actor NAME [--json]
 tq update ID [options]
 tq close ID [--reason TEXT] [--actor NAME]
 tq reopen ID
@@ -195,12 +238,13 @@ tq help [command]
 
 ### Command Details
 
-#### `tq init [--prefix PREFIX]`
+#### `tq init [--prefix PREFIX] [--dir PATH]`
 
-Initialize tq in the current directory. Creates `.tq/`, `.tq/config.json`, `.tq/issues/`, `.tq/.gitignore`.
+Initialize tq in the target directory. Creates `.tq/`, `.tq/config.json`, `.tq/issues/`, `.tq/.gitignore`.
 
-- `--prefix`: ID prefix (default: basename of current directory)
-- Fails if `.tq/` already exists.
+- `--prefix`: ID prefix (default: basename of target directory)
+- `--dir PATH`: target directory (default: CWD)
+- Fails if `.tq/` already exists (`ErrAlreadyInit`).
 
 #### `tq create TITLE [options]`
 
@@ -247,21 +291,27 @@ Output is sorted by priority (0 first), then by `created_at` (oldest first), the
 - Default: human-readable table.
 - `--json`: JSON array of issue objects.
 
+#### `tq claim ID --actor NAME [--json]`
+
+Claim an issue for work. Atomically sets status to `in_progress` and assignee to NAME. This is the primary way agents pick up work.
+
+Precondition: the issue must have status `open`. If the issue is `in_progress` or `closed`, claim fails with `ErrAlreadyClaimed` (exit code 1) and a message identifying the current status and assignee. This makes concurrent claims safe under file locking.
+
+- `--json` — output the claimed issue JSON.
+
 #### `tq update ID [options]`
 
-Update fields on an issue.
+Update fields on an issue. For claiming work, use `tq claim` instead.
 
 Options:
 - `--status STATUS` — set status
 - `--priority N` — set priority
 - `--assignee NAME` — set assignee
-- `--claim --actor NAME` — atomic claim: sets status to `in_progress` and assignee to NAME. Fails if status is not `open`.
-- `-l, --label LABEL` — replace labels (repeatable; pass once per label)
 - `--add-label LABEL` — add a label (repeatable)
 - `--remove-label LABEL` — remove a label (repeatable)
 - `--json` — output updated issue JSON
 
-The `--claim` flag is the primary way agents pick up work. It enforces that the issue is currently `open`. If the issue is already `in_progress` or `closed`, claim fails with a non-zero exit code and a clear error message. This makes concurrent claims safe under file locking.
+All fields are independently optional. Only specified fields are changed. `updated_at` is set to now on every successful update.
 
 #### `tq close ID [--reason TEXT] [--actor NAME]`
 
@@ -293,6 +343,8 @@ List dependencies for an issue. Shows what blocks it and what it blocks.
 
 - Default: human-readable.
 - `--json`: JSON object with `blocked_by` (issues that block this one) and `blocks` (issues this one blocks).
+
+Implementation note: the reverse lookup ("what does this issue block?") requires reading all issues to find those whose `blocked_by` list contains this ID. Use `readAll()` for this operation — do not attempt indexing or caching at this scale.
 
 #### `tq doctor [--json]`
 
@@ -384,11 +436,35 @@ Key decisions:
 
 On `tq dep add A B` (A is blocked by B), detect whether adding this edge would create a cycle in the dependency graph.
 
-Algorithm: starting from B, traverse `blocked_by` edges recursively (or BFS). If A is reachable from B, adding A→B would create a cycle. Reject with error.
+Algorithm: starting from B, traverse `blocked_by` edges recursively (or BFS). If A is reachable from B, adding A→B would create a cycle. Reject with `ErrCycleDetected`.
 
 This is O(n) in the number of issues, which is fine for orca's scale.
 
+Cycle detection considers **all issues regardless of status**. A cycle like A (open) → B (closed) → C (open) → A is still rejected, even though B is closed and doesn't currently block anything. Rationale: closed issues can be reopened, and a structural cycle that becomes live on reopen is a latent hazard. The dependency graph is a structural invariant, not a runtime state.
+
 Only `dep add` performs cycle detection. `doctor` also reports cycles as a diagnostic.
+
+## Edge Cases
+
+Explicit behavior for cases that implementing agents must not invent answers for:
+
+**Closing an issue that blocks others.** Nothing cascades. The blocked issues are not modified. They simply become unblocked — their `blocked_by` list now points to a closed issue, which `ready` treats as resolved. No automatic status transitions, no notifications.
+
+**Adding a dependency to or from a closed issue.** Allowed. The dependency is structural. A closed issue may be reopened later, and the dependency should be in place when it is. Cycle detection still applies regardless of issue status.
+
+**Updating fields on a closed issue.** Allowed for all fields except status (use `reopen` for that). Priority, labels, assignee, and description can be changed on closed issues. `updated_at` is set to now.
+
+**Malformed issue file.** If a file in `.tq/issues/` contains invalid JSON or fails ID validation, `list`, `ready`, and other multi-issue operations **skip the malformed file** and emit a warning to stderr. They do not fail entirely — one corrupt file should not block all operations. `doctor` reports malformed files as errors. `show` on the specific malformed issue returns an error.
+
+**Empty issues directory.** `ready`, `list`, and `dep list` return empty results, not errors.
+
+**Reopening an issue.** Sets status to `open`. Clears `closed_at` and `close_reason`. Does **not** clear `assignee` — the previous assignee may want to continue the work. To clear the assignee, use `tq update ID --assignee ""`.
+
+**Claiming an already-claimed issue.** Fails with `ErrAlreadyClaimed`. The error message includes the current status and assignee so the caller knows who holds it. The caller must pick a different issue or wait.
+
+**Duplicate dependency.** `dep add A B` when A already has B in `blocked_by` fails with `ErrDupDep`. This is not silent — the caller should know the state didn't change.
+
+**Removing a non-existent dependency.** `dep remove A B` when B is not in A's `blocked_by` fails with `ErrDepNotFound`.
 
 ## Concurrency
 
@@ -450,6 +526,7 @@ func (s *Store) Create(opts CreateOpts) (*Issue, error)
 func (s *Store) Show(id string) (*Issue, error)      // supports partial ID
 func (s *Store) List(filter ListFilter) ([]*Issue, error)
 func (s *Store) Ready() ([]*Issue, error)
+func (s *Store) Claim(id string, actor string) (*Issue, error)
 func (s *Store) Update(id string, opts UpdateOpts) (*Issue, error)
 func (s *Store) Close(id string, reason string, actor string) (*Issue, error)
 func (s *Store) Reopen(id string) (*Issue, error)
@@ -482,11 +559,8 @@ type UpdateOpts struct {
     Status       *string  // nil = don't change
     Priority     *int
     Assignee     *string
-    Labels       []string // nil = don't change, empty = clear
     AddLabels    []string
     RemoveLabels []string
-    Claim        bool     // if true, requires Actor
-    Actor        string   // used with Claim
 }
 
 type ListFilter struct {
@@ -542,7 +616,9 @@ type DoctorCheck struct {
 - **List**: filtering by status, label, assignee, priority
 - **List default**: excludes closed issues
 - **Update**: changes fields, updates `updated_at`
-- **Claim**: sets status + assignee, fails on non-open issue
+- **Update closed issue**: can change priority, labels, assignee
+- **Claim**: sets status + assignee, fails on non-open issue (ErrAlreadyClaimed with current status/assignee)
+- **Claim already in_progress**: fails with ErrAlreadyClaimed
 - **Close**: sets status, closed_at, close_reason
 - **Reopen**: clears closed_at, close_reason, sets status to open
 - **Comment**: appends to comments list
@@ -558,7 +634,8 @@ Build the binary, run it against a temp directory, check exit codes and stdout/s
 - `tq init` + `tq create` + `tq show` round-trip
 - `tq ready --json` output is valid JSON array
 - `tq show --json` output is valid JSON object
-- `tq update --claim` on already-claimed issue exits non-zero
+- `tq claim` on already-claimed issue exits non-zero with status and assignee in message
+- `tq claim` on open issue succeeds
 - `tq dep add` cycle rejection exits non-zero with clear message
 - `tq doctor --json` output schema
 - Partial ID matching in commands
@@ -576,7 +653,7 @@ When orca's Go rewrite reaches the queue layer:
 1. Add `tq` as a Go module dependency.
 2. Orca's `internal/queue` package wraps `tq.Store`:
    - `queue.ReadReady()` calls `store.Ready()`
-   - `queue.Claim()` calls `store.Update()` with claim opts
+   - `queue.Claim()` calls `store.Claim()`
    - All operations happen against the primary repo's `.tq/` directory
 3. Orca's lock-guarded write path becomes: acquire orca lock → switch to main → call tq store method → commit `.tq/` changes → push → release lock.
 4. The `.tq` source-branch guard replaces the `.beads` guard: `merge-main.sh` rejects branches carrying `.tq/` changes.
@@ -588,7 +665,41 @@ The `tq` library knows nothing about git, branches, worktrees, or orca. The orca
 
 For agents that need to call queue operations via CLI (before full library integration), orca can expose `orca queue <tq-command>` subcommands that delegate to the tq library with orca's locking and git semantics wrapped around them. This replaces the current `queue-write-main.sh` / `queue-read-main.sh` helpers.
 
+## Recommended Agent Instructions
+
+Projects using tq should include the following in their AGENTS.md or equivalent context file. This gives agents the minimum viable workflow without requiring them to read the full documentation.
+
+```markdown
+## Task Queue
+
+This project uses `tq` for task tracking. Run `tq help` for available commands.
+
+Workflow:
+1. `tq ready --json` — see available work, sorted by priority
+2. `tq claim <id> --actor <your-name>` — claim an issue before starting work
+3. Work on the issue
+4. `tq comment <id> "summary of what was done" --author <your-name>` — record progress
+5. `tq close <id> --reason "description of outcome"` — close when complete
+
+When you discover work that should be done but is outside the current task scope,
+create a follow-up issue:
+  `tq create "title" -d "description" -p 2`
+
+If the follow-up blocks the current issue, add a dependency:
+  `tq dep add <current-id> <new-id>`
+
+Do not edit files in `.tq/` directly. Use `tq` commands for all mutations.
+```
+
+This block is intentionally short. Per the context engineering research, agent instructions should be concise and action-oriented. The workflow (ready → claim → work → close) is the essential pattern. Everything else (dep management, priority semantics, label conventions) is project-specific and belongs in project-level documentation, not in the generic agent instructions.
+
 ## Design Decisions Log
+
+### Why Claim is a separate operation, not a flag on Update
+Claim has unique preconditions (status must be `open`), unique side effects (sets both status and assignee atomically), and is the single most important operation for agent coordination. Bundling it into a general-purpose Update struct creates ambiguity about precedence when Claim and Status are both set, and forces implementers to handle interaction rules that don't need to exist. A separate `Claim(id, actor)` method is simpler, more predictable, and independently testable.
+
+### Why no replace-all for labels
+An earlier draft included a `Labels []string` field on UpdateOpts where `nil` meant "don't change" and empty meant "clear all." This nil-vs-empty distinction is a footgun in Go and a source of subtle bugs. `AddLabels` and `RemoveLabels` are explicit, unambiguous, and compose naturally when the CLI has multiple `--add-label` and `--remove-label` flags.
 
 ### Why JSON files, not JSONL
 JSONL requires rewriting the entire file on any issue update. Per-file JSON gives per-issue git history, per-issue atomic writes, and direct file access for agents. See Storage section.
@@ -625,8 +736,8 @@ Build in this order. Each step produces a `go test ./...`-passing commit.
 - `store_test.go`: init, duplicate init, read/write round-trip, partial ID resolution
 
 ### Step 3: Store — Operations
-- `store.go`: Create(), Show(), List(), Update(), Close(), Reopen(), Comment()
-- `store_test.go`: all operation tests (create+show round-trip, list filtering, claim semantics, close/reopen, comment append)
+- `store.go`: Create(), Show(), List(), Claim(), Update(), Close(), Reopen(), Comment()
+- `store_test.go`: all operation tests (create+show round-trip, list filtering, claim semantics including ErrAlreadyClaimed, update on open and closed issues, close/reopen, comment append)
 
 ### Step 4: Ready and Cycle Detection
 - `ready.go`: Ready() computation, hasCycle() detection
