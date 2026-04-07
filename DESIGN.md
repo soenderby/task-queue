@@ -75,15 +75,35 @@ type Comment struct {
 
 Timestamps use RFC 3339 strings (e.g. `2026-03-23T10:00:00Z`), not `time.Time`. This keeps the JSON representation simple and avoids serialization edge cases.
 
+### Field Mutability (v1)
+
+| Field | Mutable? | How |
+|---|---|---|
+| `id` | no | immutable identity |
+| `title` | no | set on create only |
+| `description` | yes | `update --description` |
+| `status` | constrained | `claim`, `close`, `reopen`, and restricted `update --status open` |
+| `priority` | yes | `update --priority` |
+| `type` | no | set on create only |
+| `assignee` | yes | `update --assignee`, also set by `claim` / optional on `close` |
+| `labels` | yes | `update --add-label` / `--remove-label` |
+| `blocked_by` | yes (via dep ops) | `dep add` / `dep remove` only |
+| `comments` | append-only | `comment` command only |
+| `created_at` | no | set on create |
+| `created_by` | no | set on create |
+| `updated_at` | system-managed | set on each successful mutation |
+| `closed_at` | system-managed | set/cleared by `close` / `reopen` |
+| `close_reason` | system-managed + close input | set by `close --reason`, cleared by `reopen` |
+
 ### Statuses
 
 Three statuses. No custom statuses, no state machine enforcement beyond these rules:
 
-- `open` → can transition to `in_progress` or `closed`
-- `in_progress` → can transition to `open` or `closed`
-- `closed` → can transition to `open` (reopen)
+- `open` → can transition to `in_progress` (via `claim` only) or `closed` (via `close` only)
+- `in_progress` → can transition to `open` (via `update --status open`) or `closed` (via `close`)
+- `closed` → can transition to `open` (via `reopen` only)
 
-The `claim` operation atomically sets `status=in_progress` and `assignee=<actor>`. It is the intended way for agents to pick up work.
+The `claim` operation atomically sets `status=in_progress` and `assignee=<actor>`. It is the intended way for agents to pick up work, and it requires the issue to be ready under the same dependency rules as `ready`.
 
 ### Dependencies
 
@@ -100,25 +120,28 @@ The library defines sentinel errors for all failure modes that callers need to d
 
 ```go
 var (
-    ErrNotFound       = errors.New("issue not found")
-    ErrAmbiguousID    = errors.New("ambiguous issue ID")
-    ErrAlreadyClaimed = errors.New("issue is not open")
-    ErrCycleDetected  = errors.New("dependency would create cycle")
-    ErrSelfDep        = errors.New("cannot depend on self")
-    ErrDupDep         = errors.New("dependency already exists")
-    ErrDepNotFound    = errors.New("dependency does not exist")
-    ErrNotInitialized = errors.New("tq workspace not found")
-    ErrAlreadyInit    = errors.New("tq workspace already exists")
-    ErrInvalidStatus  = errors.New("invalid status value")
+    ErrNotFound        = errors.New("issue not found")
+    ErrAmbiguousID     = errors.New("ambiguous issue ID")
+    ErrAlreadyClaimed  = errors.New("issue is not open")
+    ErrBlocked         = errors.New("issue is blocked")
+    ErrCycleDetected   = errors.New("dependency would create cycle")
+    ErrSelfDep         = errors.New("cannot depend on self")
+    ErrDupDep          = errors.New("dependency already exists")
+    ErrDepNotFound     = errors.New("dependency does not exist")
+    ErrNotInitialized  = errors.New("tq workspace not found")
+    ErrAlreadyInit     = errors.New("tq workspace already exists")
+    ErrInvalidStatus   = errors.New("invalid status value")
     ErrInvalidPriority = errors.New("priority must be 0-4")
-    ErrTitleRequired  = errors.New("title is required")
-    ErrCorruptFile    = errors.New("issue file is corrupt")
+    ErrInvalidPrefix   = errors.New("id prefix is invalid")
+    ErrTitleRequired   = errors.New("title is required")
+    ErrCorruptFile     = errors.New("issue file is corrupt")
 )
 ```
 
 The CLI maps these to stderr messages and exit code 1. Error messages should be specific and actionable. Examples:
 
 - `Claim` on an in_progress issue: `"cannot claim orca-a1b2: issue is not open (status: in_progress, assignee: agent-1)"`
+- `Claim` on a blocked issue: `"cannot claim orca-a1b2: issue is blocked by orca-e5f6 (status: open)"`
 - Ambiguous partial ID: `"ambiguous ID 'a1b': matches orca-a1b2, orca-a1b9"`
 - Cycle detected: `"cannot add dependency: orca-a1b2 → orca-c3d4 would create cycle"`
 
@@ -133,7 +156,7 @@ The CLI maps these to stderr messages and exit code 1. Error messages should be 
 │   ├── orca-a1b2.json
 │   ├── orca-c3d4.json
 │   └── orca-e5f6.json
-└── .gitignore          # ignores lock file
+└── .gitignore          # ignores runtime files (lock, temp)
 ```
 
 ### Why per-file, not JSONL
@@ -188,15 +211,18 @@ File name is `{id}.json`. The ID in the file must match the file name (validated
 | `version` | Schema version. Currently `1`. For future-proofing only. |
 | `id_prefix` | Prefix for generated issue IDs. Set at `init` time. |
 
+`id_prefix` must match `^[a-z][a-z0-9-]{1,31}$` (2-32 chars, lowercase). `tq init` validates this and fails with `ErrInvalidPrefix` if invalid.
+
 ### .gitignore
 
 Created by `tq init`:
 
 ```
 lock
+issues/*.tmp
 ```
 
-The lock file is runtime-only and must not be committed.
+The lock file and temp issue files are runtime-only and must not be committed.
 
 ### Workspace Discovery
 
@@ -250,8 +276,10 @@ These flags apply to all commands (except `help`):
 
 Initialize tq in the target directory. Creates `.tq/`, `.tq/config.json`, `.tq/issues/`, `.tq/.gitignore`.
 
-- `--prefix`: ID prefix (default: basename of target directory)
+- `--prefix`: ID prefix (default: lowercase basename of target directory)
 - `--dir PATH`: target directory (default: CWD)
+- Prefix validation uses `^[a-z][a-z0-9-]{1,31}$`.
+- If the default basename-derived prefix is invalid, `init` fails with `ErrInvalidPrefix` and suggests passing `--prefix` explicitly.
 - Fails if `.tq/` already exists (`ErrAlreadyInit`).
 
 #### `tq create TITLE [options]`
@@ -273,7 +301,7 @@ Display a single issue.
 
 - Default: human-readable formatted output.
 - `--json`: output the issue JSON object.
-- Supports partial ID matching: `tq show a1b` matches `orca-a1b2` if unambiguous. Fails with error if multiple matches.
+- Supports partial ID prefix matching: `tq show a1b` matches `orca-a1b2` if unambiguous. Fails with error if multiple matches.
 
 #### `tq list [options] [--json]`
 
@@ -303,7 +331,14 @@ Output is sorted by priority (0 first), then by `created_at` (oldest first), the
 
 Claim an issue for work. Atomically sets status to `in_progress` and assignee to NAME. This is the primary way agents pick up work.
 
-Precondition: the issue must have status `open`. If the issue is `in_progress` or `closed`, claim fails with `ErrAlreadyClaimed` (exit code 1) and a message identifying the current status and assignee. This makes concurrent claims safe under file locking.
+Preconditions:
+1. Issue status must be `open`
+2. Issue must be ready (every `blocked_by` ID must resolve to a valid, parseable issue with status `closed`)
+
+If status is `in_progress` or `closed`, claim fails with `ErrAlreadyClaimed` (exit code 1) and a message identifying current status/assignee.
+If status is `open` but dependencies are unresolved, claim fails with `ErrBlocked` and a message listing unresolved blockers.
+
+This makes concurrent claims safe under file locking and prevents claiming blocked work.
 
 - `--json` — output the claimed issue JSON.
 
@@ -315,21 +350,32 @@ Options:
 - `--status STATUS` — set status
 - `--priority N` — set priority
 - `--assignee NAME` — set assignee
+- `--description TEXT` — set description (pass empty string to clear)
 - `--add-label LABEL` — add a label (repeatable)
 - `--remove-label LABEL` — remove a label (repeatable)
 - `--json` — output updated issue JSON
 
 All fields are independently optional. Only specified fields are changed. `updated_at` is set to now on every successful update.
 
-Status changes via `update` must follow the valid transitions defined in the Statuses section. In particular, `update --status` on a closed issue fails with `ErrInvalidStatus` — use `tq reopen` to transition a closed issue back to `open`.
+Status changes via `update` are intentionally restricted:
+- Allowed: `in_progress` → `open` (release back to open)
+- Not allowed: `--status in_progress` (use `tq claim` so readiness checks are enforced)
+- Not allowed: `--status closed` (use `tq close` so `closed_at` / `close_reason` semantics are explicit)
+- Not allowed on closed issues (use `tq reopen`)
+
+Disallowed forms fail with `ErrInvalidStatus`.
 
 #### `tq close ID [--reason TEXT] [--actor NAME]`
 
 Close an issue. Sets status to `closed`, `closed_at` to now. Optionally sets `close_reason` and `assignee`.
 
+Precondition: issue must be `open` or `in_progress`. Closing an already-closed issue fails with `ErrInvalidStatus`.
+
 #### `tq reopen ID`
 
 Reopen a closed issue. Sets status to `open`, clears `closed_at` and `close_reason`.
+
+Precondition: issue must be `closed`. Reopening an `open` or `in_progress` issue fails with `ErrInvalidStatus`.
 
 #### `tq comment ID TEXT [--author NAME]`
 
@@ -345,7 +391,7 @@ Add a blocking dependency: ID is blocked by BLOCKED_BY_ID. Fails if:
 
 #### `tq dep remove ID BLOCKED_BY_ID`
 
-Remove a blocking dependency.
+Remove a blocking dependency. Fails with `ErrNotFound` if either issue does not exist. Fails with `ErrDepNotFound` if both issues exist but the dependency edge is absent.
 
 #### `tq dep list ID [--json]`
 
@@ -361,20 +407,34 @@ Implementation note: the reverse lookup ("what does this issue block?") requires
 Run health checks on the tq workspace.
 
 Checks:
-1. `.tq/` directory exists
-2. `config.json` is valid
-3. `issues/` directory exists
-4. All issue files parse as valid JSON
-5. All issue file names match their contained ID
-6. No orphan dependency references (blocked_by pointing to non-existent issue)
-7. No dependency cycles
+
+| ID | Check | Status on failure | Notes |
+|---|---|---|---|
+| `workspace_dir` | `.tq/` directory exists | fail | hard requirement |
+| `config_valid` | `config.json` parses and validates | fail | includes `id_prefix` format |
+| `issues_dir` | `issues/` directory exists | fail | hard requirement |
+| `issue_json_valid` | Issue files parse as valid JSON | fail | malformed files are listed |
+| `issue_filename_matches_id` | Issue file names match contained IDs | fail | rejects mismatches |
+| `orphan_dependencies` | No orphan dependency references | fail | orphan blockers are treated as unresolved dependencies |
+| `dependency_cycles` | No dependency cycles | fail | structural invariant |
+| `stale_temp_files` | No stale `*.tmp` issue files | warn | indicates interrupted writes |
+
+`DoctorReport.OK` is `true` only when there are zero `fail` checks. `warn` checks do not flip `OK` to false.
+
+In JSON output, each check includes both a stable machine key (`id`) and a human label (`name`). Example:
+
+```json
+{"id":"orphan_dependencies","name":"No orphan dependency references","status":"fail","message":"orphan blocker IDs: orca-a1b2 -> orca-dead"}
+```
 
 ### Output Conventions
 
 - **Human output** (default): compact, tabular where appropriate. To stderr for errors, stdout for data.
-- **JSON output** (`--json`): compact single-line JSON to stdout. `show` outputs one object. `list`, `ready`, `dep list` output arrays or structured objects. Errors remain on stderr as text.
+- **JSON output** (`--json`): compact single-line JSON to stdout. `show` outputs one object. `list`, `ready`, `dep list` output arrays or structured objects. Errors and warnings are written to stderr only; stdout remains valid JSON.
 - **Exit codes**: 0 on success. 1 on error. Errors always include a message on stderr.
-- **Partial ID matching**: Any command that takes an ID accepts a partial match (prefix or substring of the hex portion). Ambiguous matches (multiple issues match) fail with an error listing the matches.
+- **Partial ID matching**: Any command that takes an ID accepts prefix matching only. Resolution order: exact full ID match first; otherwise, prefix match against full IDs and hex suffixes (e.g. `a1b` matches `orca-a1b2`). Ambiguous matches fail with an error listing candidates.
+
+These output conventions are CLI-only. Library APIs do not print to stdout/stderr.
 
 ### Human Output Formats
 
@@ -412,7 +472,7 @@ On collision (generated ID already exists as a file), regenerate. At orca's scal
 
 Use `crypto/rand` for hex generation, not `math/rand`.
 
-Partial ID matching: users can refer to `a1b2` or `orca-a1b` and tq resolves it if unambiguous.
+Partial ID matching is prefix-only: users can refer to `a1b2` or `orca-a1b`, and tq resolves it if unambiguous.
 
 ## Ready Computation
 
@@ -426,7 +486,8 @@ ready(all_issues) → []Issue:
         for each blocker_id in candidate.blocked_by:
             blocker = lookup(blocker_id, all_issues)
             if blocker is nil:
-                continue                     # orphan dep: treat as non-blocking (doctor warns)
+                is_ready = false             # missing/corrupt blocker: unresolved, blocks readiness
+                break
             if blocker.status != "closed":
                 is_ready = false
                 break
@@ -438,7 +499,8 @@ ready(all_issues) → []Issue:
 
 Key decisions:
 - Only `open` issues are candidates. `in_progress` means already claimed — not ready for another agent.
-- Orphan dependencies (blocked_by referencing a deleted/non-existent issue) are treated as resolved, not blocking. `tq doctor` reports these as warnings.
+- Orphan dependencies (blocked_by referencing a deleted/non-existent issue) are treated as unresolved and therefore blocking. `tq doctor` reports these as failures.
+- Corrupt/malformed blocker files are also treated as unresolved and therefore blocking. `tq doctor` reports these as failures.
 - Sort is deterministic: priority first (lower number = higher priority), then creation time (older first), then ID (lexicographic tiebreak).
 
 ## Cycle Detection
@@ -457,23 +519,42 @@ Only `dep add` performs cycle detection. `doctor` also reports cycles as a diagn
 
 Explicit behavior for cases that implementing agents must not invent answers for:
 
+**Closing an already-closed issue.** Fails with `ErrInvalidStatus`. Close is not idempotent.
+
 **Closing an issue that blocks others.** Nothing cascades. The blocked issues are not modified. They simply become unblocked — their `blocked_by` list now points to a closed issue, which `ready` treats as resolved. No automatic status transitions, no notifications.
 
 **Adding a dependency to or from a closed issue.** Allowed. The dependency is structural. A closed issue may be reopened later, and the dependency should be in place when it is. Cycle detection still applies regardless of issue status.
 
-**Updating fields on a closed issue.** Allowed for all fields except status (use `reopen` for that). Priority, labels, assignee, and description can be changed on closed issues. `updated_at` is set to now.
+**Updating fields on a closed issue.** Allowed for mutable non-status fields. In v1 this means priority, labels, assignee, and description. Status changes on closed issues require `reopen`. `updated_at` is set to now.
 
-**Malformed issue file.** If a file in `.tq/issues/` contains invalid JSON or fails ID validation, `list`, `ready`, and other multi-issue operations **skip the malformed file** and emit a warning to stderr. They do not fail entirely — one corrupt file should not block all operations. `doctor` reports malformed files as errors. `show` on the specific malformed issue returns `ErrCorruptFile`.
+**Setting `in_progress` via `update`.** Not allowed. `update --status in_progress` fails with `ErrInvalidStatus`; use `claim` so dependency readiness is enforced.
+
+**Setting `closed` via `update`.** Not allowed. `update --status closed` fails with `ErrInvalidStatus`; use `close` so closure metadata is set intentionally.
+
+**Malformed issue file.** If a file in `.tq/issues/` contains invalid JSON or fails ID validation, `list`, `ready`, and other multi-issue operations **skip the malformed file** rather than failing the whole command. `doctor` reports malformed files as errors. `show` on the specific malformed issue returns `ErrCorruptFile`. All single-target mutations (`claim`, `update`, `close`, `reopen`, `comment`, `dep add`, `dep remove`) on a corrupt target issue return `ErrCorruptFile`.
+
+CLI behavior: prints warnings for skipped files to stderr.
+Library behavior: does not write to stderr/stdout; it returns best-effort results and leaves diagnostics to `Doctor()` / caller policy.
 
 **Empty issues directory.** `ready`, `list`, and `dep list` return empty results, not errors.
 
+**Orphan dependency reference.** If an issue references a non-existent blocker ID, that blocker is treated as unresolved: the issue is not ready and cannot be claimed. `doctor` reports this as a failure.
+
+**Corrupt blocker issue file.** If a blocker issue file exists but is malformed/corrupt, it is treated as unresolved for `ready` and `claim` (same effect as orphan blocker). `doctor` reports the corrupt file as a failure.
+
 **Reopening an issue.** Sets status to `open`. Clears `closed_at` and `close_reason`. Does **not** clear `assignee` — the previous assignee may want to continue the work. To clear the assignee, use `tq update ID --assignee ""`.
+
+**Reopening a non-closed issue.** Fails with `ErrInvalidStatus`. Reopen only works on `closed` issues.
+
+**Claiming a blocked issue.** Not allowed. If status is `open` but at least one blocker is not `closed`, `claim` fails with `ErrBlocked` and reports unresolved blockers.
 
 **Claiming an already-claimed issue.** Fails with `ErrAlreadyClaimed`. The error message includes the current status and assignee so the caller knows who holds it. The caller must pick a different issue or wait.
 
 **Duplicate dependency.** `dep add A B` when A already has B in `blocked_by` fails with `ErrDupDep`. This is not silent — the caller should know the state didn't change.
 
-**Removing a non-existent dependency.** `dep remove A B` when B is not in A's `blocked_by` fails with `ErrDepNotFound`.
+**Removing a non-existent dependency.** `dep remove A B` when either issue does not exist fails with `ErrNotFound`. When both exist but the edge is absent, fails with `ErrDepNotFound`.
+
+**Stale temporary files (`*.tmp`).** If interrupted writes leave `.tq/issues/*.tmp` files behind, normal commands ignore them. `tq doctor` reports them as warnings.
 
 ## Concurrency
 
@@ -490,6 +571,13 @@ tq uses file locking for safe concurrent access. The lock file is `.tq/lock`.
 ### Read operations (show, list, ready, dep list):
 
 No locking required. Reads are not transactional — they see whatever is on disk. At orca's scale and access pattern (one writer at a time via orca's own lock), this is safe. If a read races with a write, it gets either the old or new state of the file (atomic rename guarantees no partial reads).
+
+### Platform assumptions
+
+- v1 targets local POSIX-like filesystems (Linux/macOS/WSL).
+- Locking assumes `flock` semantics for `.tq/lock`.
+- Atomic write safety assumes rename-in-place semantics on the same filesystem.
+- Network/distributed filesystems with weak locking/rename guarantees are out of scope for v1.
 
 ### Orca integration
 
@@ -544,12 +632,15 @@ func (s *Store) Comment(id string, author string, text string) (*Issue, error)
 // Dependency operations
 func (s *Store) DepAdd(id string, blockedBy string) error
 func (s *Store) DepRemove(id string, blockedBy string) error
+func (s *Store) DepList(id string) (*DepGraph, error)
 
 // Diagnostics
 func (s *Store) Doctor() (*DoctorReport, error)
 
 // All reads and writes in these methods handle file locking internally.
 ```
+
+Library note: public API methods never write to stdout/stderr. Callers own presentation and warning policy.
 
 ### Option Types
 
@@ -568,6 +659,7 @@ type UpdateOpts struct {
     Status       *string  // nil = don't change
     Priority     *int
     Assignee     *string
+    Description  *string
     AddLabels    []string
     RemoveLabels []string
 }
@@ -579,13 +671,19 @@ type ListFilter struct {
     Priority *int
 }
 
+type DepGraph struct {
+    BlockedBy []*Issue `json:"blocked_by"`
+    Blocks    []*Issue `json:"blocks"`
+}
+
 type DoctorReport struct {
     Checks []DoctorCheck `json:"checks"`
     OK     bool          `json:"ok"`
 }
 
 type DoctorCheck struct {
-    Name    string `json:"name"`
+    ID      string `json:"id"`      // stable machine key, e.g. "orphan_dependencies"
+    Name    string `json:"name"`    // human-readable label
     Status  string `json:"status"`  // "pass", "warn", "fail"
     Message string `json:"message"`
 }
@@ -606,7 +704,8 @@ type DoctorCheck struct {
   - Multiple blockers, some closed some open → not ready
   - `in_progress` issues excluded from ready
   - Closed issues excluded from ready
-  - Orphan dependency (non-existent blocker) → treated as ready
+  - Orphan dependency (non-existent blocker) → not ready
+  - Corrupt/malformed blocker file → not ready
   - Sort order: priority, then created_at, then id
 - **Cycle detection**: table-driven. Cases:
   - No cycle → allowed
@@ -625,23 +724,36 @@ type DoctorCheck struct {
 - **Show malformed file**: returns `ErrCorruptFile`
 - **List**: filtering by status, label, assignee, priority
 - **List default**: excludes closed issues
-- **List with malformed file**: skips corrupt file, returns valid issues, emits warning
-- **Update**: changes fields, updates `updated_at`
-- **Update closed issue**: can change priority, labels, assignee
+- **List with malformed file**: skips corrupt file and returns valid issues
+- **Update**: changes fields (including description), updates `updated_at`
+- **Update description clear**: `--description ""` clears description
+- **Update closed issue**: can change priority, labels, assignee, description
 - **Update status on closed issue**: fails with `ErrInvalidStatus`
-- **Claim**: sets status + assignee, fails on non-open issue (ErrAlreadyClaimed with current status/assignee)
+- **Update --status in_progress**: fails with `ErrInvalidStatus` (must use `Claim`)
+- **Update --status closed**: fails with `ErrInvalidStatus` (must use `Close`)
+- **Claim**: sets status + assignee for ready open issues
 - **Claim already in_progress**: fails with ErrAlreadyClaimed
+- **Claim blocked open issue**: fails with `ErrBlocked` and unresolved blocker details
+- **Claim with orphan blocker**: fails with `ErrBlocked`
+- **Claim with corrupt blocker file**: fails with `ErrBlocked`
 - **Close**: sets status, closed_at, close_reason
 - **Close with actor**: sets assignee
+- **Close already closed**: fails with `ErrInvalidStatus`
 - **Reopen**: clears closed_at, close_reason, sets status to open, preserves assignee
+- **Reopen non-closed issue**: fails with `ErrInvalidStatus`
 - **Comment**: appends to comments list
+- **Mutation on corrupt target issue**: returns `ErrCorruptFile` (claim, update, close, reopen, comment)
 - **Dep add**: adds to blocked_by, fails on cycle, fails on self, fails on non-existent, fails on duplicate (`ErrDupDep`)
 - **Dep add to/from closed issue**: succeeds (deps are structural)
 - **Dep remove**: removes from blocked_by
-- **Dep remove non-existent**: fails with `ErrDepNotFound`
+- **Dep remove non-existent edge**: fails with `ErrDepNotFound`
+- **Dep remove non-existent issue**: fails with `ErrNotFound`
+- **Dep list**: returns `blocked_by` and reverse `blocks` views
 - **Ready**: end-to-end with real files
+- **Ready with orphan blocker**: excludes issue from ready results
 - **Ready with malformed file**: skips corrupt file, returns valid ready issues
-- **Doctor**: detects orphan deps, cycles, invalid files, malformed JSON
+- **Ready with malformed blocker reference**: affected issue is not ready
+- **Doctor**: detects orphan deps, cycles, invalid files, malformed JSON, stale `*.tmp` files
 
 ### CLI tests
 
@@ -652,10 +764,18 @@ Build the binary, run it against a temp directory, check exit codes and stdout/s
 - `tq ready --json` output is valid JSON array
 - `tq show --json` output is valid JSON object
 - `tq claim` on already-claimed issue exits non-zero with status and assignee in message
-- `tq claim` on open issue succeeds
-- `tq update --status in_progress` on closed issue exits non-zero
+- `tq claim` on blocked open issue exits non-zero with blocker details
+- `tq claim` with orphan blocker exits non-zero with blocker details
+- `tq claim` with corrupt blocker exits non-zero with blocker details
+- `tq claim` on ready open issue succeeds
+- `tq update --status in_progress` exits non-zero (must use `claim`)
+- `tq update --status closed` exits non-zero (must use `close`)
+- `tq close` on already-closed issue exits non-zero
+- `tq reopen` on non-closed issue exits non-zero
 - `tq dep add` cycle rejection exits non-zero with clear message
-- `tq doctor --json` output schema
+- `tq dep list --json` output has `blocked_by` and `blocks`
+- malformed file warning behavior: warning on stderr while stdout remains valid JSON
+- `tq doctor --json` output schema (including per-check `id` and `name`)
 - Partial ID matching in commands
 - `--dir` flag overrides workspace discovery
 - `TQ_DIR` env var overrides workspace discovery
@@ -716,7 +836,7 @@ This block is intentionally short. Per the context engineering research, agent i
 ## Design Decisions Log
 
 ### Why Claim is a separate operation, not a flag on Update
-Claim has unique preconditions (status must be `open`), unique side effects (sets both status and assignee atomically), and is the single most important operation for agent coordination. Bundling it into a general-purpose Update struct creates ambiguity about precedence when Claim and Status are both set, and forces implementers to handle interaction rules that don't need to exist. A separate `Claim(id, actor)` method is simpler, more predictable, and independently testable.
+Claim has unique preconditions (status must be `open` and dependencies must be ready), unique side effects (sets both status and assignee atomically), and is the single most important operation for agent coordination. Bundling it into a general-purpose Update struct creates ambiguity about precedence when Claim and Status are both set, and forces implementers to handle interaction rules that don't need to exist. A separate `Claim(id, actor)` method is simpler, more predictable, and independently testable.
 
 ### Why no replace-all for labels
 An earlier draft included a `Labels []string` field on UpdateOpts where `nil` meant "don't change" and empty meant "clear all." This nil-vs-empty distinction is a footgun in Go and a source of subtle bugs. `AddLabels` and `RemoveLabels` are explicit, unambiguous, and compose naturally when the CLI has multiple `--add-label` and `--remove-label` flags.
@@ -739,13 +859,33 @@ Separation of concerns. tq manages task data. The caller (human or orca) manages
 ### Why not build this into orca directly
 The task queue is a general-purpose primitive. Building it as a standalone tool means: (a) it can be tested and validated independently, (b) it can be used outside orca, (c) orca's complexity doesn't bleed into the task layer. If it proves useful, orca imports the library. If it doesn't, orca can switch to something else without gutting its internals.
 
+## Tradeoffs (Explicit, Accepted)
+
+These are the main costs accepted by the current design. They are intentional and not treated as defects.
+
+| Decision | Benefit | Accepted Cost |
+|---|---|---|
+| Per-issue JSON files under `.tq/issues/` | Great git diffs, simple direct inspection, atomic per-issue writes | Directory scan for many operations; no rich querying/indexing |
+| No database | Zero dependencies, easy portability | No secondary indexes, no SQL-style queries, linear scans |
+| No daemon/service | Simpler ops model, no background state | Every command pays startup/read cost; no push-based notifications |
+| tq does not run git | Clean separation of concerns; reusable outside git | Callers must implement commit/push discipline correctly |
+| Three statuses only (`open`, `in_progress`, `closed`) | Low cognitive load and transition complexity | Less expressive lifecycle; some states must be inferred |
+| Single dependency type (`blocked_by`) | Minimal model; readiness stays simple | Cannot represent richer relationships structurally |
+| `ready` includes only `open` issues | Clean “what can be picked now” semantics | Separate reporting required for `in_progress` work |
+| `claim` requires readiness (not just `open` status) | Prevents agents from starting blocked work and reduces queue confusion | No early reservation of blocked issues; handoff patterns must use comments/assignee updates instead |
+| Orphan blockers treated as blocking in `ready`/`claim` | Prevents work from starting when dependency graph is inconsistent | Stale/mistyped dependency IDs can halt progress until fixed |
+| Prefix-only partial ID matching | Deterministic and predictable resolution | Less flexible than fuzzy/substring matching |
+| Read operations are unlocked | Low contention and simple implementation | Reads are not transactional snapshots |
+| POSIX-local filesystem assumptions (`flock`, atomic rename) | Simple and robust on target environments | Native Windows / weak network FS semantics are out of v1 scope |
+| Description is mutable via `update` | Allows refinement as understanding improves | Potential drift/churn in issue text; original wording is not preserved unless tracked in comments/git history |
+
 ## Implementation Sequence
 
 Build in this order. Each step produces a `go test ./...`-passing commit.
 
 ### Step 1: Types, Errors, and Validation
 - `issue.go`: Issue, Comment, CreateOpts, UpdateOpts, ListFilter types
-- `issue.go`: sentinel errors (ErrNotFound, ErrAlreadyClaimed, ErrCycleDetected, etc.)
+- `issue.go`: sentinel errors (ErrNotFound, ErrAlreadyClaimed, ErrBlocked, ErrCycleDetected, etc.)
 - `issue.go`: ID generation (prefix + 4 hex via crypto/rand)
 - `issue.go`: validation functions (required fields, status values, priority range, status transitions)
 - `issue_test.go`: table-driven validation tests, ID format tests
@@ -758,13 +898,13 @@ Build in this order. Each step produces a `go test ./...`-passing commit.
 
 ### Step 3: Store — Operations
 - `store.go`: Create(), Show(), List(), Claim(), Update(), Close(), Reopen(), Comment()
-- `store_test.go`: all operation tests (create+show round-trip, list filtering, claim semantics including ErrAlreadyClaimed, update on open and closed issues, close/reopen, comment append)
+- `store_test.go`: all operation tests (create+show round-trip, list filtering, claim semantics including `ErrAlreadyClaimed` and `ErrBlocked`, update on open and closed issues, close/reopen, comment append)
 
 ### Step 4: Ready and Cycle Detection
 - `ready.go`: Ready() computation, hasCycle() detection
-- `store.go`: DepAdd(), DepRemove() (using cycle detection)
+- `store.go`: DepAdd(), DepRemove(), DepList() (using cycle detection)
 - `ready_test.go`: table-driven ready computation and cycle detection tests
-- `store_test.go`: dep add/remove tests with real files
+- `store_test.go`: dep add/remove/list tests with real files
 
 ### Step 5: Doctor
 - `store.go`: Doctor() diagnostics
@@ -781,12 +921,22 @@ Build in this order. Each step produces a `go test ./...`-passing commit.
 - Agent setup instructions (what to put in AGENTS.md)
 - Examples
 
-## Open Questions
+## Decisions Required Before Implementation
 
-These are deferred decisions that can be revisited after initial implementation:
+None. This design is implementation-ready as written.
 
-1. **Should `ready` include an `--include-in-progress` flag?** Currently `ready` only returns `open` issues. Orca's planner might want to see `in_progress` issues too for status reporting. Defer until orca integration reveals the need.
+## V1 Scope Decisions
 
-2. **Should `tq` support bulk operations?** e.g., `tq close --all-ready`. Probably not — the agent or harness can loop. Defer unless a real workflow pain point emerges.
+The following are explicitly decided for v1:
 
-3. **Archive/purge for old closed issues?** Currently closed issues stay as files forever. A `tq archive` command could move them to `.tq/archive/`. Defer until file count becomes a problem (unlikely at orca's scale).
+1. **`ready` does not include `in_progress` issues.**
+   - `ready` returns only issues with `status == open` whose blockers are closed.
+   - No `--include-in-progress` flag in v1.
+
+2. **Bulk operations are out of scope for v1.**
+   - No commands like `tq close --all-ready`.
+   - Callers can loop over individual operations.
+
+3. **Archive/purge is out of scope for v1.**
+   - Closed issues remain in `.tq/issues/`.
+   - No `tq archive` command in v1.
