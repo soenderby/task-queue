@@ -579,6 +579,42 @@ No locking required. Reads are not transactional — they see whatever is on dis
 - Atomic write safety assumes rename-in-place semantics on the same filesystem.
 - Network/distributed filesystems with weak locking/rename guarantees are out of scope for v1.
 
+### Implementation Notes
+
+These resolve small but real decisions the implementer would otherwise make ad-hoc. They are binding for v1.
+
+**1. Priority default handling.**
+`CreateOpts.Priority` is `*int`. `nil` means "use default 2". Non-nil values are validated against 0–4. Zero is a valid value (critical), not a sentinel. The CLI `-p/--priority` flag passes through as a `*int` (unset flag → `nil`).
+
+**2. Empty-string clearing on Update.**
+For pointer-typed string fields in `UpdateOpts` (`Description`, `Assignee`), a non-nil pointer to an empty string clears the field. A nil pointer means "do not change". This applies uniformly. CLI passes `--description ""` and `--assignee ""` as non-nil empty strings.
+
+**3. File locking.**
+Use `syscall.Flock(fd, syscall.LOCK_EX)` on `.tq/lock`. Blocking acquisition, no timeout in v1. The lock file is created if missing, opened `O_RDWR|O_CREATE` with mode `0o644`. The fd is closed after the mutation completes, which releases the lock. Rationale: at tq's scale and usage pattern (single writer, usually under an outer orca lock), contention is effectively zero. Adding a timeout is deferred until a concrete failure mode appears.
+
+**4. Durable atomic writes.**
+Write sequence for issue files:
+1. Create `.tq/issues/{id}.json.tmp` with `O_WRONLY|O_CREATE|O_TRUNC`, mode `0o644`
+2. Write JSON payload
+3. `fsync` the tmp file
+4. `rename` tmp → final path
+5. `fsync` the `.tq/issues/` directory
+
+Step 5 ensures the rename is durable across crashes on ext4/xfs. Steps 3 and 5 are required for v1 crash-safety claims.
+
+**5. JSON serialization details.**
+- Indent: 2 spaces via `json.MarshalIndent(v, "", "  ")`
+- Trailing newline: yes (one `\n` appended after the marshaled bytes) — keeps files POSIX-text and git-friendly
+- Empty slices: serialize as missing fields (all slice fields on `Issue` use `omitempty`). Do not emit `"labels": []` or `"blocked_by": []`. Rationale: smaller files, cleaner diffs, fewer no-op churn lines.
+- Field order: follows the Go struct declaration order in `issue.go` (which is the canonical order used in the design doc example).
+- Unknown fields on read: `json.Decoder.DisallowUnknownFields()` is **not** used. Forward-compatible reads; unknown fields are ignored. Round-tripping is not guaranteed to preserve unknown fields.
+
+**6. Time source.**
+`Store` holds an internal `now func() time.Time`, defaulting to `time.Now`. It is not part of the public `Open`/`Init` signature. Tests inject fake clocks via an unexported helper (e.g. `newStoreForTest(dir string, now func() time.Time)`). All timestamps written by mutations use `s.now().UTC().Format(time.RFC3339)` for consistent UTC RFC 3339 output.
+
+**7. Module path.**
+`github.com/soenderby/task-queue`. Package name `tq`. Binary name `tq` built from `./cmd/tq/`.
+
 ### Orca integration
 
 When orca embeds tq as a library, orca's own lock-guarded write path on main provides the outer serialization. tq's internal file lock provides a safety net but is not the primary concurrency control. The two lock layers compose safely (tq lock is always acquired inside orca lock, never the reverse).
@@ -648,7 +684,7 @@ Library note: public API methods never write to stdout/stderr. Callers own prese
 type CreateOpts struct {
     Title       string
     Description string
-    Priority    int      // 0-4, default 2
+    Priority    *int     // nil = default 2; 0-4 otherwise
     Type        string   // default "task"
     Labels      []string
     Assignee    string
