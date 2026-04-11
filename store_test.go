@@ -692,3 +692,237 @@ func TestComment(t *testing.T) {
 		t.Fatalf("expected ErrCorruptFile, got: %v", err)
 	}
 }
+
+func TestDepAdd(t *testing.T) {
+	_, s := setupStore(t)
+	writeTestIssue(t, s, "orca-a1b2")
+	writeTestIssue(t, s, "orca-b1b2")
+
+	if err := s.DepAdd("orca-a1b2", "orca-b1b2"); err != nil {
+		t.Fatalf("DepAdd failed: %v", err)
+	}
+
+	updated, err := s.readIssue("orca-a1b2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.BlockedBy) != 1 || updated.BlockedBy[0] != "orca-b1b2" {
+		t.Fatalf("unexpected blocked_by: %+v", updated.BlockedBy)
+	}
+}
+
+func TestDepAddErrors(t *testing.T) {
+	t.Run("self dependency", func(t *testing.T) {
+		_, s := setupStore(t)
+		writeTestIssue(t, s, "orca-a1b2")
+		err := s.DepAdd("orca-a1b2", "orca-a1b2")
+		if !errors.Is(err, ErrSelfDep) {
+			t.Fatalf("expected ErrSelfDep, got: %v", err)
+		}
+	})
+
+	t.Run("duplicate", func(t *testing.T) {
+		_, s := setupStore(t)
+		writeTestIssue(t, s, "orca-a1b2")
+		writeTestIssue(t, s, "orca-b1b2")
+		if err := s.DepAdd("orca-a1b2", "orca-b1b2"); err != nil {
+			t.Fatalf("first dep add failed: %v", err)
+		}
+		err := s.DepAdd("orca-a1b2", "orca-b1b2")
+		if !errors.Is(err, ErrDupDep) {
+			t.Fatalf("expected ErrDupDep, got: %v", err)
+		}
+	})
+
+	t.Run("not found issue", func(t *testing.T) {
+		_, s := setupStore(t)
+		writeTestIssue(t, s, "orca-b1b2")
+		err := s.DepAdd("orca-missing", "orca-b1b2")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound, got: %v", err)
+		}
+	})
+
+	t.Run("not found blocker", func(t *testing.T) {
+		_, s := setupStore(t)
+		writeTestIssue(t, s, "orca-a1b2")
+		err := s.DepAdd("orca-a1b2", "orca-missing")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound, got: %v", err)
+		}
+	})
+
+	t.Run("cycle", func(t *testing.T) {
+		_, s := setupStore(t)
+		writeTestIssue(t, s, "orca-a1b2")
+		writeTestIssue(t, s, "orca-b1b2")
+		writeTestIssue(t, s, "orca-c1b2")
+		if err := s.DepAdd("orca-a1b2", "orca-b1b2"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DepAdd("orca-b1b2", "orca-c1b2"); err != nil {
+			t.Fatal(err)
+		}
+		err := s.DepAdd("orca-c1b2", "orca-a1b2")
+		if !errors.Is(err, ErrCycleDetected) {
+			t.Fatalf("expected ErrCycleDetected, got: %v", err)
+		}
+	})
+}
+
+func TestDepAddClosedIssuesAllowed(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "A", Status: StatusClosed, Priority: 2, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z", ClosedAt: "2026-03-22T11:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-b1b2", Title: "B", Status: StatusClosed, Priority: 2, CreatedAt: "2026-03-22T10:05:00Z", UpdatedAt: "2026-03-22T10:05:00Z", ClosedAt: "2026-03-22T11:05:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DepAdd("orca-a1b2", "orca-b1b2"); err != nil {
+		t.Fatalf("DepAdd should allow closed issues, got: %v", err)
+	}
+}
+
+func TestDepRemove(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "A", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-b1b2"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	writeTestIssue(t, s, "orca-b1b2")
+
+	if err := s.DepRemove("orca-a1b2", "orca-b1b2"); err != nil {
+		t.Fatalf("DepRemove failed: %v", err)
+	}
+
+	updated, err := s.readIssue("orca-a1b2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.BlockedBy) != 0 {
+		t.Fatalf("expected no blockers, got: %+v", updated.BlockedBy)
+	}
+}
+
+func TestDepRemoveErrors(t *testing.T) {
+	t.Run("non-existent edge", func(t *testing.T) {
+		_, s := setupStore(t)
+		writeTestIssue(t, s, "orca-a1b2")
+		writeTestIssue(t, s, "orca-b1b2")
+
+		err := s.DepRemove("orca-a1b2", "orca-b1b2")
+		if !errors.Is(err, ErrDepNotFound) {
+			t.Fatalf("expected ErrDepNotFound, got: %v", err)
+		}
+	})
+
+	t.Run("missing issue", func(t *testing.T) {
+		_, s := setupStore(t)
+		writeTestIssue(t, s, "orca-b1b2")
+		err := s.DepRemove("orca-missing", "orca-b1b2")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("expected ErrNotFound, got: %v", err)
+		}
+	})
+}
+
+func TestDepList(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "A", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-b1b2"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-b1b2", Title: "B", Status: StatusClosed, Priority: 2, CreatedAt: "2026-03-22T09:00:00Z", UpdatedAt: "2026-03-22T09:00:00Z", ClosedAt: "2026-03-22T09:30:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-c1b2", Title: "C", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-a1b2"}, CreatedAt: "2026-03-22T11:00:00Z", UpdatedAt: "2026-03-22T11:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	graph, err := s.DepList("orca-a1b2")
+	if err != nil {
+		t.Fatalf("DepList failed: %v", err)
+	}
+	if len(graph.BlockedBy) != 1 || graph.BlockedBy[0].ID != "orca-b1b2" {
+		t.Fatalf("unexpected blocked_by list: %+v", graph.BlockedBy)
+	}
+	if len(graph.Blocks) != 1 || graph.Blocks[0].ID != "orca-c1b2" {
+		t.Fatalf("unexpected blocks list: %+v", graph.Blocks)
+	}
+}
+
+func TestReadyEndToEnd(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "A", Status: StatusOpen, Priority: 2, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-b1b2", Title: "B", Status: StatusOpen, Priority: 1, BlockedBy: []string{"orca-c1b2"}, CreatedAt: "2026-03-22T09:00:00Z", UpdatedAt: "2026-03-22T09:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-c1b2", Title: "C", Status: StatusClosed, Priority: 0, CreatedAt: "2026-03-22T08:00:00Z", UpdatedAt: "2026-03-22T08:00:00Z", ClosedAt: "2026-03-22T08:30:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-d1b2", Title: "D", Status: StatusInProgress, Priority: 0, CreatedAt: "2026-03-22T07:00:00Z", UpdatedAt: "2026-03-22T07:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ready, err := s.Ready()
+	if err != nil {
+		t.Fatalf("Ready failed: %v", err)
+	}
+	if len(ready) != 2 {
+		t.Fatalf("expected 2 ready issues, got %d", len(ready))
+	}
+	if ready[0].ID != "orca-b1b2" || ready[1].ID != "orca-a1b2" {
+		t.Fatalf("unexpected ready order: %s, %s", ready[0].ID, ready[1].ID)
+	}
+}
+
+func TestReadyOrphanAndCorruptCases(t *testing.T) {
+	t.Run("orphan blocker excluded", func(t *testing.T) {
+		_, s := setupStore(t)
+		if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "A", Status: StatusOpen, Priority: 1, BlockedBy: []string{"orca-missing"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+			t.Fatal(err)
+		}
+		ready, err := s.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ready) != 0 {
+			t.Fatalf("expected no ready issues, got %+v", ready)
+		}
+	})
+
+	t.Run("malformed issue file skipped", func(t *testing.T) {
+		_, s := setupStore(t)
+		writeTestIssue(t, s, "orca-a1b2")
+		if err := os.WriteFile(filepath.Join(s.issuesDir(), "orca-bad1.json"), []byte("{not json}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		ready, err := s.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ready) != 1 || ready[0].ID != "orca-a1b2" {
+			t.Fatalf("unexpected ready result with malformed file: %+v", ready)
+		}
+	})
+
+	t.Run("malformed blocker excluded", func(t *testing.T) {
+		_, s := setupStore(t)
+		if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "A", Status: StatusOpen, Priority: 1, BlockedBy: []string{"orca-b1b2"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(s.issuesDir(), "orca-b1b2.json"), []byte("{not json}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		ready, err := s.Ready()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ready) != 0 {
+			t.Fatalf("expected blocked issue to be excluded, got %+v", ready)
+		}
+	})
+}

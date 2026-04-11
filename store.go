@@ -658,6 +658,115 @@ func (s *Store) Comment(id string, author string, text string) (*Issue, error) {
 	return updated, nil
 }
 
+// Ready returns issues that are open and fully unblocked.
+func (s *Store) Ready() ([]*Issue, error) {
+	all, _ := s.readAll()
+	return computeReady(all), nil
+}
+
+// DepAdd adds a dependency edge: id is blocked by blockedBy.
+func (s *Store) DepAdd(id string, blockedBy string) error {
+	return s.withLock(func() error {
+		resolvedID, err := s.resolveID(id)
+		if err != nil {
+			return err
+		}
+		resolvedBlockedBy, err := s.resolveID(blockedBy)
+		if err != nil {
+			return err
+		}
+
+		if resolvedID == resolvedBlockedBy {
+			return ErrSelfDep
+		}
+
+		issue, err := s.readIssue(resolvedID)
+		if err != nil {
+			return err
+		}
+		if _, err := s.readIssue(resolvedBlockedBy); err != nil {
+			return err
+		}
+
+		if hasString(issue.BlockedBy, resolvedBlockedBy) {
+			return ErrDupDep
+		}
+
+		all, _ := s.readAll()
+		if hasCycle(all, resolvedID, resolvedBlockedBy) {
+			return ErrCycleDetected
+		}
+
+		issue.BlockedBy = append(issue.BlockedBy, resolvedBlockedBy)
+		issue.UpdatedAt = s.nowRFC3339()
+		return s.writeIssue(issue)
+	})
+}
+
+// DepRemove removes a dependency edge.
+func (s *Store) DepRemove(id string, blockedBy string) error {
+	return s.withLock(func() error {
+		resolvedID, err := s.resolveID(id)
+		if err != nil {
+			return err
+		}
+		resolvedBlockedBy, err := s.resolveID(blockedBy)
+		if err != nil {
+			return err
+		}
+
+		issue, err := s.readIssue(resolvedID)
+		if err != nil {
+			return err
+		}
+		if _, err := s.readIssue(resolvedBlockedBy); err != nil {
+			return err
+		}
+
+		if !hasString(issue.BlockedBy, resolvedBlockedBy) {
+			return ErrDepNotFound
+		}
+
+		issue.BlockedBy = removeString(issue.BlockedBy, resolvedBlockedBy)
+		if len(issue.BlockedBy) == 0 {
+			issue.BlockedBy = nil
+		}
+		issue.UpdatedAt = s.nowRFC3339()
+		return s.writeIssue(issue)
+	})
+}
+
+// DepList lists issue dependency relationships.
+func (s *Store) DepList(id string) (*DepGraph, error) {
+	resolvedID, err := s.resolveID(id)
+	if err != nil {
+		return nil, err
+	}
+	issue, err := s.readIssue(resolvedID)
+	if err != nil {
+		return nil, err
+	}
+
+	blockedBy := make([]*Issue, 0, len(issue.BlockedBy))
+	for _, blockerID := range issue.BlockedBy {
+		blocker, err := s.readIssue(blockerID)
+		if err != nil {
+			continue
+		}
+		blockedBy = append(blockedBy, blocker)
+	}
+
+	all, _ := s.readAll()
+	blocks := make([]*Issue, 0)
+	for _, candidate := range all {
+		if hasString(candidate.BlockedBy, resolvedID) {
+			blocks = append(blocks, candidate)
+		}
+	}
+
+	return &DepGraph{BlockedBy: blockedBy, Blocks: blocks}, nil
+}
+
 func hasString(values []string, want string) bool {
 	for _, v := range values {
 		if v == want {
