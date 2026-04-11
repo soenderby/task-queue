@@ -926,3 +926,146 @@ func TestReadyOrphanAndCorruptCases(t *testing.T) {
 		}
 	})
 }
+
+func findCheck(t *testing.T, report *DoctorReport, id string) DoctorCheck {
+	t.Helper()
+	for _, check := range report.Checks {
+		if check.ID == id {
+			return check
+		}
+	}
+	t.Fatalf("check %q not found", id)
+	return DoctorCheck{}
+}
+
+func TestDoctorClean(t *testing.T) {
+	_, s := setupStore(t)
+	writeTestIssue(t, s, "orca-a1b2")
+
+	report, err := s.Doctor()
+	if err != nil {
+		t.Fatalf("Doctor failed: %v", err)
+	}
+	if !report.OK {
+		t.Fatalf("expected report.OK=true, got false: %+v", report)
+	}
+
+	ids := []string{
+		"workspace_dir",
+		"config_valid",
+		"issues_dir",
+		"issue_json_valid",
+		"issue_filename_matches_id",
+		"orphan_dependencies",
+		"dependency_cycles",
+		"stale_temp_files",
+	}
+	for _, id := range ids {
+		check := findCheck(t, report, id)
+		if check.Status != "pass" {
+			t.Fatalf("expected check %q to pass, got %q (%s)", id, check.Status, check.Message)
+		}
+	}
+}
+
+func TestDoctorOrphanDep(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "A", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-missing"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := s.Doctor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := findCheck(t, report, "orphan_dependencies")
+	if check.Status != "fail" {
+		t.Fatalf("expected orphan_dependencies fail, got %q", check.Status)
+	}
+	if report.OK {
+		t.Fatal("expected report.OK=false when fail checks exist")
+	}
+}
+
+func TestDoctorCycle(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "A", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-b1b2"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-b1b2", Title: "B", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-a1b2"}, CreatedAt: "2026-03-22T10:05:00Z", UpdatedAt: "2026-03-22T10:05:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := s.Doctor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := findCheck(t, report, "dependency_cycles")
+	if check.Status != "fail" {
+		t.Fatalf("expected dependency_cycles fail, got %q", check.Status)
+	}
+}
+
+func TestDoctorCorruptJSON(t *testing.T) {
+	_, s := setupStore(t)
+	if err := os.WriteFile(filepath.Join(s.issuesDir(), "orca-a1b2.json"), []byte("{not json}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := s.Doctor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := findCheck(t, report, "issue_json_valid")
+	if check.Status != "fail" {
+		t.Fatalf("expected issue_json_valid fail, got %q", check.Status)
+	}
+}
+
+func TestDoctorFilenameMismatch(t *testing.T) {
+	_, s := setupStore(t)
+	issue := &Issue{
+		ID:        "orca-aaaa",
+		Title:     "Mismatch",
+		Status:    StatusOpen,
+		Priority:  2,
+		CreatedAt: "2026-03-22T10:00:00Z",
+		UpdatedAt: "2026-03-22T10:00:00Z",
+	}
+	data, err := json.MarshalIndent(issue, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(filepath.Join(s.issuesDir(), "orca-bbbb.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := s.Doctor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := findCheck(t, report, "issue_filename_matches_id")
+	if check.Status != "fail" {
+		t.Fatalf("expected issue_filename_matches_id fail, got %q", check.Status)
+	}
+}
+
+func TestDoctorStaleTmpWarnOnly(t *testing.T) {
+	_, s := setupStore(t)
+	if err := os.WriteFile(filepath.Join(s.issuesDir(), "orca-a1b2.json.tmp"), []byte("tmp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := s.Doctor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := findCheck(t, report, "stale_temp_files")
+	if check.Status != "warn" {
+		t.Fatalf("expected stale_temp_files warn, got %q", check.Status)
+	}
+	if !report.OK {
+		t.Fatal("expected report.OK=true when only warnings exist")
+	}
+}

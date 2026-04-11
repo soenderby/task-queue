@@ -767,6 +767,209 @@ func (s *Store) DepList(id string) (*DepGraph, error) {
 	return &DepGraph{BlockedBy: blockedBy, Blocks: blocks}, nil
 }
 
+// Doctor runs health checks for the workspace.
+func (s *Store) Doctor() (*DoctorReport, error) {
+	checks := make([]DoctorCheck, 0, 8)
+
+	addCheck := func(id, name, status, message string) {
+		checks = append(checks, DoctorCheck{ID: id, Name: name, Status: status, Message: message})
+	}
+
+	// 1) workspace_dir
+	if st, err := os.Stat(s.tqDir); err != nil || !st.IsDir() {
+		if err != nil {
+			addCheck("workspace_dir", ".tq/ directory exists", "fail", err.Error())
+		} else {
+			addCheck("workspace_dir", ".tq/ directory exists", "fail", "not a directory")
+		}
+	} else {
+		addCheck("workspace_dir", ".tq/ directory exists", "pass", "")
+	}
+
+	// 2) config_valid
+	cfg, err := readConfig(filepath.Join(s.tqDir, "config.json"))
+	if err != nil {
+		addCheck("config_valid", "config.json parses and validates", "fail", err.Error())
+	} else if err := validatePrefix(cfg.IDPrefix); err != nil {
+		addCheck("config_valid", "config.json parses and validates", "fail", err.Error())
+	} else {
+		addCheck("config_valid", "config.json parses and validates", "pass", "")
+	}
+
+	issuesDir := s.issuesDir()
+
+	// 3) issues_dir
+	if st, err := os.Stat(issuesDir); err != nil || !st.IsDir() {
+		if err != nil {
+			addCheck("issues_dir", "issues/ directory exists", "fail", err.Error())
+		} else {
+			addCheck("issues_dir", "issues/ directory exists", "fail", "not a directory")
+		}
+	} else {
+		addCheck("issues_dir", "issues/ directory exists", "pass", "")
+	}
+
+	entries, readDirErr := os.ReadDir(issuesDir)
+
+	parseable := make([]*Issue, 0)
+	jsonInvalid := make([]string, 0)
+	filenameMismatches := make([]string, 0)
+	if readDirErr != nil {
+		jsonInvalid = append(jsonInvalid, "cannot read issues dir: "+readDirErr.Error())
+		filenameMismatches = append(filenameMismatches, "cannot read issues dir: "+readDirErr.Error())
+	} else {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if strings.HasSuffix(name, ".tmp") || !strings.HasSuffix(name, ".json") {
+				continue
+			}
+
+			path := filepath.Join(issuesDir, name)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				jsonInvalid = append(jsonInvalid, name+": "+err.Error())
+				continue
+			}
+
+			var issue Issue
+			if err := json.Unmarshal(data, &issue); err != nil {
+				jsonInvalid = append(jsonInvalid, name)
+				continue
+			}
+			parseable = append(parseable, &issue)
+
+			expectedID := strings.TrimSuffix(name, ".json")
+			if issue.ID != expectedID {
+				filenameMismatches = append(filenameMismatches, fmt.Sprintf("%s contains id %s", name, issue.ID))
+			}
+		}
+	}
+
+	// 4) issue_json_valid
+	if len(jsonInvalid) > 0 {
+		addCheck("issue_json_valid", "Issue files parse as valid JSON", "fail", strings.Join(jsonInvalid, "; "))
+	} else {
+		addCheck("issue_json_valid", "Issue files parse as valid JSON", "pass", "")
+	}
+
+	// 5) issue_filename_matches_id
+	if len(filenameMismatches) > 0 {
+		addCheck("issue_filename_matches_id", "Issue file names match contained IDs", "fail", strings.Join(filenameMismatches, "; "))
+	} else {
+		addCheck("issue_filename_matches_id", "Issue file names match contained IDs", "pass", "")
+	}
+
+	// 6) orphan_dependencies
+	orphans := make([]string, 0)
+	if readDirErr != nil {
+		orphans = append(orphans, "cannot read issues dir: "+readDirErr.Error())
+	} else {
+		for _, issue := range parseable {
+			for _, blockerID := range issue.BlockedBy {
+				if _, err := os.Stat(s.issuePath(blockerID)); errors.Is(err, os.ErrNotExist) {
+					orphans = append(orphans, fmt.Sprintf("%s -> %s", issue.ID, blockerID))
+				}
+			}
+		}
+	}
+	if len(orphans) > 0 {
+		addCheck("orphan_dependencies", "No orphan dependency references", "fail", "orphan blocker IDs: "+strings.Join(orphans, ", "))
+	} else {
+		addCheck("orphan_dependencies", "No orphan dependency references", "pass", "")
+	}
+
+	// 7) dependency_cycles
+	cycles := detectCycles(parseable)
+	if len(cycles) > 0 {
+		addCheck("dependency_cycles", "No dependency cycles", "fail", "cycles: "+strings.Join(cycles, "; "))
+	} else {
+		addCheck("dependency_cycles", "No dependency cycles", "pass", "")
+	}
+
+	// 8) stale_temp_files
+	tmpFiles, err := filepath.Glob(filepath.Join(issuesDir, "*.tmp"))
+	if err != nil {
+		addCheck("stale_temp_files", "No stale *.tmp issue files", "warn", err.Error())
+	} else if len(tmpFiles) > 0 {
+		addCheck("stale_temp_files", "No stale *.tmp issue files", "warn", strings.Join(tmpFiles, ", "))
+	} else {
+		addCheck("stale_temp_files", "No stale *.tmp issue files", "pass", "")
+	}
+
+	ok := true
+	for _, check := range checks {
+		if check.Status == "fail" {
+			ok = false
+			break
+		}
+	}
+
+	return &DoctorReport{Checks: checks, OK: ok}, nil
+}
+
+func detectCycles(all []*Issue) []string {
+	byID := make(map[string]*Issue, len(all))
+	for _, issue := range all {
+		byID[issue.ID] = issue
+	}
+
+	const (
+		unvisited = 0
+		visiting  = 1
+		visited   = 2
+	)
+
+	state := make(map[string]int, len(byID))
+	stack := make([]string, 0, len(byID))
+	stackIndex := make(map[string]int, len(byID))
+	seen := make(map[string]struct{})
+	cycles := make([]string, 0)
+
+	var dfs func(string)
+	dfs = func(node string) {
+		state[node] = visiting
+		stackIndex[node] = len(stack)
+		stack = append(stack, node)
+
+		issue := byID[node]
+		for _, next := range issue.BlockedBy {
+			if _, ok := byID[next]; !ok {
+				continue
+			}
+
+			switch state[next] {
+			case unvisited:
+				dfs(next)
+			case visiting:
+				start := stackIndex[next]
+				cycle := append([]string(nil), stack[start:]...)
+				cycle = append(cycle, next)
+				cycleKey := strings.Join(cycle, " -> ")
+				if _, ok := seen[cycleKey]; !ok {
+					seen[cycleKey] = struct{}{}
+					cycles = append(cycles, cycleKey)
+				}
+			}
+		}
+
+		stack = stack[:len(stack)-1]
+		delete(stackIndex, node)
+		state[node] = visited
+	}
+
+	for id := range byID {
+		if state[id] == unvisited {
+			dfs(id)
+		}
+	}
+
+	sort.Strings(cycles)
+	return cycles
+}
+
 func hasString(values []string, want string) bool {
 	for _, v := range values {
 		if v == want {
