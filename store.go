@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -294,4 +295,385 @@ func (s *Store) withLock(fn func() error) error {
 	}
 
 	return fn()
+}
+
+func (s *Store) nowRFC3339() string {
+	return s.now().UTC().Format(time.RFC3339)
+}
+
+// Create creates a new issue.
+func (s *Store) Create(opts CreateOpts) (*Issue, error) {
+	if err := validateTitle(opts.Title); err != nil {
+		return nil, err
+	}
+
+	priority := DefaultPriority
+	if opts.Priority != nil {
+		priority = *opts.Priority
+	}
+	if err := validatePriority(priority); err != nil {
+		return nil, err
+	}
+
+	issueType := opts.Type
+	if issueType == "" {
+		issueType = DefaultType
+	}
+
+	var created *Issue
+	err := s.withLock(func() error {
+		for {
+			id, err := generateID(s.prefix)
+			if err != nil {
+				return fmt.Errorf("generate id: %w", err)
+			}
+			if _, err := os.Stat(s.issuePath(id)); err == nil {
+				continue // collision, try again
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("check id collision for %s: %w", id, err)
+			}
+
+			now := s.nowRFC3339()
+			created = &Issue{
+				ID:          id,
+				Title:       opts.Title,
+				Description: opts.Description,
+				Status:      StatusOpen,
+				Priority:    priority,
+				Type:        issueType,
+				Assignee:    opts.Assignee,
+				Labels:      append([]string(nil), opts.Labels...),
+				CreatedAt:   now,
+				CreatedBy:   opts.CreatedBy,
+				UpdatedAt:   now,
+			}
+
+			if err := s.writeIssue(created); err != nil {
+				return err
+			}
+			return nil
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return created, nil
+}
+
+// Show returns one issue, resolving partial IDs.
+func (s *Store) Show(id string) (*Issue, error) {
+	resolvedID, err := s.resolveID(id)
+	if err != nil {
+		return nil, err
+	}
+	return s.readIssue(resolvedID)
+}
+
+// List returns filtered issues.
+func (s *Store) List(filter ListFilter) ([]*Issue, error) {
+	issues, _ := s.readAll()
+
+	statusAllowed := map[string]struct{}{}
+	for _, st := range filter.Status {
+		statusAllowed[st] = struct{}{}
+	}
+
+	labelAllowed := filter.Label
+	filtered := make([]*Issue, 0, len(issues))
+	for _, issue := range issues {
+		if len(filter.Status) == 0 {
+			if issue.Status == StatusClosed {
+				continue
+			}
+		} else {
+			if _, ok := statusAllowed[issue.Status]; !ok {
+				continue
+			}
+		}
+
+		if filter.Assignee != "" && issue.Assignee != filter.Assignee {
+			continue
+		}
+		if filter.Priority != nil && issue.Priority != *filter.Priority {
+			continue
+		}
+
+		if len(labelAllowed) > 0 {
+			allLabelsPresent := true
+			for _, want := range labelAllowed {
+				if !hasString(issue.Labels, want) {
+					allLabelsPresent = false
+					break
+				}
+			}
+			if !allLabelsPresent {
+				continue
+			}
+		}
+
+		filtered = append(filtered, issue)
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].Priority != filtered[j].Priority {
+			return filtered[i].Priority < filtered[j].Priority
+		}
+		if filtered[i].CreatedAt != filtered[j].CreatedAt {
+			return filtered[i].CreatedAt < filtered[j].CreatedAt
+		}
+		return filtered[i].ID < filtered[j].ID
+	})
+
+	return filtered, nil
+}
+
+// Claim claims an issue for an actor.
+func (s *Store) Claim(id string, actor string) (*Issue, error) {
+	var claimed *Issue
+	err := s.withLock(func() error {
+		resolvedID, err := s.resolveID(id)
+		if err != nil {
+			return err
+		}
+
+		issue, err := s.readIssue(resolvedID)
+		if err != nil {
+			return err
+		}
+
+		if issue.Status != StatusOpen {
+			return fmt.Errorf("cannot claim %s: %w (status: %s, assignee: %s)", issue.ID, ErrAlreadyClaimed, issue.Status, issue.Assignee)
+		}
+
+		var unresolved []string
+		for _, blockerID := range issue.BlockedBy {
+			blocker, err := s.readIssue(blockerID)
+			if err != nil {
+				if errors.Is(err, ErrNotFound) || errors.Is(err, ErrCorruptFile) {
+					unresolved = append(unresolved, blockerID)
+					continue
+				}
+				return err
+			}
+			if blocker.Status != StatusClosed {
+				unresolved = append(unresolved, blockerID)
+			}
+		}
+
+		if len(unresolved) > 0 {
+			return fmt.Errorf("cannot claim %s: %w by %s", issue.ID, ErrBlocked, strings.Join(unresolved, ", "))
+		}
+
+		issue.Status = StatusInProgress
+		issue.Assignee = actor
+		issue.UpdatedAt = s.nowRFC3339()
+
+		if err := s.writeIssue(issue); err != nil {
+			return err
+		}
+		claimed = issue
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return claimed, nil
+}
+
+// Update updates mutable issue fields.
+func (s *Store) Update(id string, opts UpdateOpts) (*Issue, error) {
+	var updated *Issue
+	err := s.withLock(func() error {
+		resolvedID, err := s.resolveID(id)
+		if err != nil {
+			return err
+		}
+
+		issue, err := s.readIssue(resolvedID)
+		if err != nil {
+			return err
+		}
+
+		if opts.Status != nil {
+			if issue.Status == StatusClosed {
+				return ErrInvalidStatus
+			}
+			if err := validateUpdateStatusTransition(issue.Status, *opts.Status); err != nil {
+				return err
+			}
+			issue.Status = *opts.Status
+		}
+
+		if opts.Priority != nil {
+			if err := validatePriority(*opts.Priority); err != nil {
+				return err
+			}
+			issue.Priority = *opts.Priority
+		}
+
+		if opts.Assignee != nil {
+			issue.Assignee = *opts.Assignee
+		}
+		if opts.Description != nil {
+			issue.Description = *opts.Description
+		}
+
+		if len(opts.AddLabels) > 0 {
+			for _, add := range opts.AddLabels {
+				if !hasString(issue.Labels, add) {
+					issue.Labels = append(issue.Labels, add)
+				}
+			}
+		}
+
+		if len(opts.RemoveLabels) > 0 {
+			for _, remove := range opts.RemoveLabels {
+				issue.Labels = removeString(issue.Labels, remove)
+			}
+			if len(issue.Labels) == 0 {
+				issue.Labels = nil
+			}
+		}
+
+		issue.UpdatedAt = s.nowRFC3339()
+		if err := s.writeIssue(issue); err != nil {
+			return err
+		}
+		updated = issue
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// Close closes an issue.
+func (s *Store) Close(id string, reason string, actor string) (*Issue, error) {
+	var closed *Issue
+	err := s.withLock(func() error {
+		resolvedID, err := s.resolveID(id)
+		if err != nil {
+			return err
+		}
+
+		issue, err := s.readIssue(resolvedID)
+		if err != nil {
+			return err
+		}
+
+		if issue.Status != StatusOpen && issue.Status != StatusInProgress {
+			return ErrInvalidStatus
+		}
+
+		now := s.nowRFC3339()
+		issue.Status = StatusClosed
+		issue.ClosedAt = now
+		issue.CloseReason = reason
+		if actor != "" {
+			issue.Assignee = actor
+		}
+		issue.UpdatedAt = now
+
+		if err := s.writeIssue(issue); err != nil {
+			return err
+		}
+		closed = issue
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return closed, nil
+}
+
+// Reopen reopens a closed issue.
+func (s *Store) Reopen(id string) (*Issue, error) {
+	var reopened *Issue
+	err := s.withLock(func() error {
+		resolvedID, err := s.resolveID(id)
+		if err != nil {
+			return err
+		}
+
+		issue, err := s.readIssue(resolvedID)
+		if err != nil {
+			return err
+		}
+
+		if issue.Status != StatusClosed {
+			return ErrInvalidStatus
+		}
+
+		issue.Status = StatusOpen
+		issue.ClosedAt = ""
+		issue.CloseReason = ""
+		issue.UpdatedAt = s.nowRFC3339()
+
+		if err := s.writeIssue(issue); err != nil {
+			return err
+		}
+		reopened = issue
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return reopened, nil
+}
+
+// Comment appends a comment to an issue.
+func (s *Store) Comment(id string, author string, text string) (*Issue, error) {
+	var updated *Issue
+	err := s.withLock(func() error {
+		resolvedID, err := s.resolveID(id)
+		if err != nil {
+			return err
+		}
+
+		issue, err := s.readIssue(resolvedID)
+		if err != nil {
+			return err
+		}
+
+		commentAt := s.nowRFC3339()
+		issue.Comments = append(issue.Comments, Comment{
+			Author:    author,
+			Text:      text,
+			CreatedAt: commentAt,
+		})
+		issue.UpdatedAt = commentAt
+
+		if err := s.writeIssue(issue); err != nil {
+			return err
+		}
+		updated = issue
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+func hasString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func removeString(values []string, remove string) []string {
+	result := make([]string, 0, len(values))
+	for _, v := range values {
+		if v == remove {
+			continue
+		}
+		result = append(result, v)
+	}
+	return result
 }

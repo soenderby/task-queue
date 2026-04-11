@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -290,5 +291,404 @@ func TestResolveIDAmbiguous(t *testing.T) {
 	_, err := s.resolveID("a1b")
 	if !errors.Is(err, ErrAmbiguousID) {
 		t.Fatalf("expected ErrAmbiguousID, got: %v", err)
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
+func strPtr(v string) *string { return &v }
+
+func TestCreateShow(t *testing.T) {
+	_, s := setupStore(t)
+
+	created, err := s.Create(CreateOpts{
+		Title:       "Fix login timeout",
+		Description: "Investigate timeout value",
+		Priority:    intPtr(1),
+		Type:        "bug",
+		Labels:      []string{"ck:auth", "px:exclusive"},
+		Assignee:    "agent-1",
+		CreatedBy:   "jsk",
+	})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	if !strings.HasPrefix(created.ID, "orca-") {
+		t.Fatalf("unexpected created ID: %q", created.ID)
+	}
+	if created.Status != StatusOpen {
+		t.Fatalf("expected status open, got %q", created.Status)
+	}
+	if created.Priority != 1 {
+		t.Fatalf("expected priority 1, got %d", created.Priority)
+	}
+
+	shown, err := s.Show(created.ID)
+	if err != nil {
+		t.Fatalf("Show failed: %v", err)
+	}
+	if shown.Title != "Fix login timeout" {
+		t.Fatalf("unexpected title: %q", shown.Title)
+	}
+
+	suffix := strings.TrimPrefix(created.ID, "orca-")
+	partial := suffix[:3]
+	shownByPartial, err := s.Show(partial)
+	if err != nil {
+		t.Fatalf("Show by partial ID failed: %v", err)
+	}
+	if shownByPartial.ID != created.ID {
+		t.Fatalf("expected ID %q, got %q", created.ID, shownByPartial.ID)
+	}
+}
+
+func TestCreateDefaults(t *testing.T) {
+	_, s := setupStore(t)
+	created, err := s.Create(CreateOpts{Title: "Default values test"})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	if created.Priority != DefaultPriority {
+		t.Fatalf("expected default priority %d, got %d", DefaultPriority, created.Priority)
+	}
+	if created.Type != DefaultType {
+		t.Fatalf("expected default type %q, got %q", DefaultType, created.Type)
+	}
+}
+
+func TestCreateTitleRequired(t *testing.T) {
+	_, s := setupStore(t)
+	_, err := s.Create(CreateOpts{Title: ""})
+	if !errors.Is(err, ErrTitleRequired) {
+		t.Fatalf("expected ErrTitleRequired, got: %v", err)
+	}
+}
+
+func TestListDefaultAndFilters(t *testing.T) {
+	_, s := setupStore(t)
+
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "A", Status: StatusOpen, Priority: 2, Labels: []string{"l1", "l2"}, Assignee: "x", CreatedAt: "2026-03-22T09:00:00Z", UpdatedAt: "2026-03-22T09:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-b1b2", Title: "B", Status: StatusInProgress, Priority: 1, Labels: []string{"l1"}, Assignee: "y", CreatedAt: "2026-03-22T08:00:00Z", UpdatedAt: "2026-03-22T08:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-c1b2", Title: "C", Status: StatusClosed, Priority: 0, Labels: []string{"l2"}, Assignee: "x", CreatedAt: "2026-03-22T07:00:00Z", UpdatedAt: "2026-03-22T07:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := s.List(ListFilter{})
+	if err != nil {
+		t.Fatalf("List default failed: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 non-closed issues, got %d", len(all))
+	}
+	if all[0].ID != "orca-b1b2" || all[1].ID != "orca-a1b2" {
+		t.Fatalf("unexpected sort/order: %s, %s", all[0].ID, all[1].ID)
+	}
+
+	byStatus, err := s.List(ListFilter{Status: []string{StatusClosed}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byStatus) != 1 || byStatus[0].ID != "orca-c1b2" {
+		t.Fatalf("status filter failed: %+v", byStatus)
+	}
+
+	byLabel, err := s.List(ListFilter{Label: []string{"l1", "l2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byLabel) != 1 || byLabel[0].ID != "orca-a1b2" {
+		t.Fatalf("label filter failed: %+v", byLabel)
+	}
+
+	byAssignee, err := s.List(ListFilter{Assignee: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byAssignee) != 1 || byAssignee[0].ID != "orca-a1b2" {
+		t.Fatalf("assignee filter failed: %+v", byAssignee)
+	}
+
+	byPriority, err := s.List(ListFilter{Priority: intPtr(1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(byPriority) != 1 || byPriority[0].ID != "orca-b1b2" {
+		t.Fatalf("priority filter failed: %+v", byPriority)
+	}
+}
+
+func TestClaim(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{
+		ID:        "orca-a1b2",
+		Title:     "Claim me",
+		Status:    StatusOpen,
+		Priority:  2,
+		CreatedAt: "2026-03-22T10:00:00Z",
+		UpdatedAt: "2026-03-22T10:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := s.Claim("orca-a1b2", "agent-1")
+	if err != nil {
+		t.Fatalf("Claim failed: %v", err)
+	}
+	if claimed.Status != StatusInProgress {
+		t.Fatalf("expected in_progress, got %q", claimed.Status)
+	}
+	if claimed.Assignee != "agent-1" {
+		t.Fatalf("expected assignee agent-1, got %q", claimed.Assignee)
+	}
+	if claimed.UpdatedAt != fixedNow().Format(time.RFC3339) {
+		t.Fatalf("unexpected updated_at: %q", claimed.UpdatedAt)
+	}
+}
+
+func TestClaimAlreadyClaimed(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Claimed", Status: StatusInProgress, Priority: 2, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z", Assignee: "agent-x"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.Claim("orca-a1b2", "agent-1")
+	if !errors.Is(err, ErrAlreadyClaimed) {
+		t.Fatalf("expected ErrAlreadyClaimed, got: %v", err)
+	}
+}
+
+func TestClaimBlocked(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-block", Title: "Blocker", Status: StatusOpen, Priority: 2, CreatedAt: "2026-03-22T09:00:00Z", UpdatedAt: "2026-03-22T09:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-block"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.Claim("orca-a1b2", "agent-1")
+	if !errors.Is(err, ErrBlocked) {
+		t.Fatalf("expected ErrBlocked, got: %v", err)
+	}
+}
+
+func TestClaimBlockedOrphanAndCorrupt(t *testing.T) {
+	t.Run("orphan blocker", func(t *testing.T) {
+		_, s := setupStore(t)
+		if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-missing"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.Claim("orca-a1b2", "agent-1")
+		if !errors.Is(err, ErrBlocked) {
+			t.Fatalf("expected ErrBlocked, got: %v", err)
+		}
+	})
+
+	t.Run("corrupt blocker", func(t *testing.T) {
+		_, s := setupStore(t)
+		if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-dead"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+			t.Fatal(err)
+		}
+		badPath := filepath.Join(s.issuesDir(), "orca-dead.json")
+		if err := os.WriteFile(badPath, []byte("{not json}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.Claim("orca-a1b2", "agent-1")
+		if !errors.Is(err, ErrBlocked) {
+			t.Fatalf("expected ErrBlocked, got: %v", err)
+		}
+	})
+}
+
+func TestClaimUnblocked(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-block", Title: "Blocker", Status: StatusClosed, Priority: 2, CreatedAt: "2026-03-22T09:00:00Z", UpdatedAt: "2026-03-22T09:00:00Z", ClosedAt: "2026-03-22T09:30:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusOpen, Priority: 2, BlockedBy: []string{"orca-block"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := s.Claim("orca-a1b2", "agent-1")
+	if err != nil {
+		t.Fatalf("claim should succeed, got: %v", err)
+	}
+	if claimed.Status != StatusInProgress {
+		t.Fatalf("expected in_progress, got %q", claimed.Status)
+	}
+}
+
+func TestUpdate(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusInProgress, Priority: 2, Description: "old", Assignee: "agent-1", Labels: []string{"l1"}, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.Update("orca-a1b2", UpdateOpts{
+		Status:       strPtr(StatusOpen),
+		Priority:     intPtr(1),
+		Assignee:     strPtr(""),
+		Description:  strPtr(""),
+		AddLabels:    []string{"l2", "l1"},
+		RemoveLabels: []string{"l1", "missing"},
+	})
+	if err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+	if updated.Status != StatusOpen {
+		t.Fatalf("expected open status, got %q", updated.Status)
+	}
+	if updated.Priority != 1 {
+		t.Fatalf("expected priority 1, got %d", updated.Priority)
+	}
+	if updated.Assignee != "" {
+		t.Fatalf("expected assignee cleared, got %q", updated.Assignee)
+	}
+	if updated.Description != "" {
+		t.Fatalf("expected description cleared, got %q", updated.Description)
+	}
+	if len(updated.Labels) != 1 || updated.Labels[0] != "l2" {
+		t.Fatalf("unexpected labels after update: %+v", updated.Labels)
+	}
+}
+
+func TestUpdateInvalidStatusTransitions(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusOpen, Priority: 2, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.Update("orca-a1b2", UpdateOpts{Status: strPtr(StatusInProgress)})
+	if !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("expected ErrInvalidStatus for in_progress, got: %v", err)
+	}
+	_, err = s.Update("orca-a1b2", UpdateOpts{Status: strPtr(StatusClosed)})
+	if !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("expected ErrInvalidStatus for closed, got: %v", err)
+	}
+	_, err = s.Update("orca-a1b2", UpdateOpts{Status: strPtr(StatusOpen)})
+	if !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("expected ErrInvalidStatus for open->open, got: %v", err)
+	}
+}
+
+func TestUpdateOnClosedIssue(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusClosed, Priority: 2, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z", ClosedAt: "2026-03-22T11:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.Update("orca-a1b2", UpdateOpts{Priority: intPtr(1), Assignee: strPtr("agent-2"), Description: strPtr("desc"), AddLabels: []string{"l1"}})
+	if err != nil {
+		t.Fatalf("update closed mutable fields failed: %v", err)
+	}
+	if updated.Priority != 1 || updated.Assignee != "agent-2" || updated.Description != "desc" {
+		t.Fatalf("unexpected updated closed issue: %+v", updated)
+	}
+
+	_, err = s.Update("orca-a1b2", UpdateOpts{Status: strPtr(StatusOpen)})
+	if !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("expected ErrInvalidStatus for closed status update, got: %v", err)
+	}
+}
+
+func TestUpdateOnCorruptTargetIssue(t *testing.T) {
+	_, s := setupStore(t)
+	badPath := filepath.Join(s.issuesDir(), "orca-a1b2.json")
+	if err := os.WriteFile(badPath, []byte("{not json}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.Update("orca-a1b2", UpdateOpts{Priority: intPtr(1)})
+	if !errors.Is(err, ErrCorruptFile) {
+		t.Fatalf("expected ErrCorruptFile, got: %v", err)
+	}
+}
+
+func TestClose(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusInProgress, Priority: 2, Assignee: "agent-1", CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	closed, err := s.Close("orca-a1b2", "done", "agent-2")
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if closed.Status != StatusClosed {
+		t.Fatalf("expected closed status, got %q", closed.Status)
+	}
+	if closed.CloseReason != "done" {
+		t.Fatalf("expected close reason 'done', got %q", closed.CloseReason)
+	}
+	if closed.Assignee != "agent-2" {
+		t.Fatalf("expected assignee agent-2, got %q", closed.Assignee)
+	}
+	if closed.ClosedAt == "" {
+		t.Fatal("expected closed_at to be set")
+	}
+
+	_, err = s.Close("orca-a1b2", "again", "")
+	if !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("expected ErrInvalidStatus closing already closed, got: %v", err)
+	}
+}
+
+func TestReopen(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusClosed, Priority: 2, Assignee: "agent-1", CloseReason: "done", ClosedAt: "2026-03-22T11:00:00Z", CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T11:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := s.Reopen("orca-a1b2")
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	if reopened.Status != StatusOpen {
+		t.Fatalf("expected open status, got %q", reopened.Status)
+	}
+	if reopened.ClosedAt != "" || reopened.CloseReason != "" {
+		t.Fatalf("expected close metadata cleared, got closed_at=%q reason=%q", reopened.ClosedAt, reopened.CloseReason)
+	}
+	if reopened.Assignee != "agent-1" {
+		t.Fatalf("expected assignee preserved, got %q", reopened.Assignee)
+	}
+
+	_, err = s.Reopen("orca-a1b2")
+	if !errors.Is(err, ErrInvalidStatus) {
+		t.Fatalf("expected ErrInvalidStatus reopening non-closed, got: %v", err)
+	}
+}
+
+func TestComment(t *testing.T) {
+	_, s := setupStore(t)
+	if err := s.writeIssue(&Issue{ID: "orca-a1b2", Title: "Target", Status: StatusOpen, Priority: 2, CreatedAt: "2026-03-22T10:00:00Z", UpdatedAt: "2026-03-22T10:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.Comment("orca-a1b2", "agent-1", "Investigated issue")
+	if err != nil {
+		t.Fatalf("Comment failed: %v", err)
+	}
+	if len(updated.Comments) != 1 {
+		t.Fatalf("expected one comment, got %d", len(updated.Comments))
+	}
+	if updated.Comments[0].Author != "agent-1" || updated.Comments[0].Text != "Investigated issue" {
+		t.Fatalf("unexpected comment: %+v", updated.Comments[0])
+	}
+
+	badPath := filepath.Join(s.issuesDir(), "orca-bad1.json")
+	if err := os.WriteFile(badPath, []byte("{not json}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Comment("orca-bad1", "agent-1", "x")
+	if !errors.Is(err, ErrCorruptFile) {
+		t.Fatalf("expected ErrCorruptFile, got: %v", err)
 	}
 }
